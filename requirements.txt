@@ -1,0 +1,17 @@
+# Core vision + numerics
+numpy>=1.24
+opencv-python>=4.8
+
+# Screen capture / image handling
+pillow>=10.0
+
+# Desktop automation (mouse/keyboard)
+pyautogui>=0.9.54
+
+# Global kill hotkey listener (pyautogui has no hotkey API)
+pynput>=1.7
+
+# Reasoning backends
+openai>=1.30
+google-generativeai>=0.8.3
+google-genai>=1.0

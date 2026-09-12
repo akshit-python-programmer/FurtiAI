@@ -1,0 +1,6 @@
+# Optional: PaddleOCR text grounding for the multi-step task pipeline.
+# Install with: pip install -r requirements-ocr.txt
+# PaddleOCR is heavy (~1 GB with model downloads); the pipeline degrades
+# gracefully to icon matching + screenshot reasoning when it is absent.
+paddleocr>=3.0
+paddlepaddle>=3.0
