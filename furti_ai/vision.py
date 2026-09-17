@@ -56,9 +56,12 @@ class VisionReflex:
         """
         template = cv2.imread(skill.template_path, cv2.IMREAD_COLOR)
         if template is None:
-            raise FileNotFoundError(
-                f"Template image could not be read: {skill.template_path}"
+            logger.error(
+                "Template image could not be read for skill %r: %s",
+                skill.name,
+                skill.template_path,
             )
+            return False
 
         screen_img = self._screen.capture()
         match = self._match(screen_img, template)
@@ -167,6 +170,8 @@ class VisionReflex:
         cx, cy = center
         action = skill.action
         metadata = skill.metadata
+        params = metadata.get("params")
+        params = params if isinstance(params, dict) else {}
 
         if action == ActionType.CLICK:
             self._input.click(cx, cy)
@@ -174,6 +179,22 @@ class VisionReflex:
             self._input.double_click(cx, cy)
         elif action == ActionType.RIGHT_CLICK:
             self._input.right_click(cx, cy)
+        elif action == ActionType.DRAG:
+            delta = metadata.get("drag_delta")
+            if not isinstance(delta, (list, tuple)) or len(delta) != 2:
+                raise ValueError("drag reflex has no recorded drag_delta")
+            hold_keys = metadata.get("drag_hold_keys")
+            if isinstance(hold_keys, str):
+                hold_keys = [hold_keys]
+            self._input.drag(
+                cx,
+                cy,
+                int(cx + delta[0]),
+                int(cy + delta[1]),
+                button=str(metadata.get("drag_button") or "left"),
+                duration=metadata.get("duration"),
+                hold_keys=list(hold_keys) if hold_keys else None,
+            )
         elif action == ActionType.TYPE:
             self._input.click(cx, cy)  # focus the field first
             text = str(metadata.get("text") or "")
@@ -183,6 +204,10 @@ class VisionReflex:
             self._input.click(cx, cy)  # focus the pane first
             self._input.scroll(int(metadata.get("scroll_clicks", 3)))
         elif action == ActionType.KEY_PRESS:
-            self._input.press_key(str(metadata.get("key", "enter")))
+            key = str(metadata.get("key") or params.get("key") or "enter")
+            presses = params.get("presses")
+            self._input.press_key(
+                key, presses=int(presses) if isinstance(presses, (int, float)) else 1
+            )
         else:  # pragma: no cover - defensive
             raise ValueError(f"Unsupported action type: {action}")

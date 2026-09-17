@@ -24,6 +24,12 @@ from .models import Skill
 logger = logging.getLogger(__name__)
 
 
+def _template_exists(skill: Skill) -> bool:
+    """True when the skill's stored template image is still on disk."""
+    raw = str(skill.template_path or "").strip()
+    return bool(raw) and Path(raw).is_file()
+
+
 class MemoryManager:
     """Persistent key/value skill cache backed by a JSON file."""
 
@@ -43,9 +49,56 @@ class MemoryManager:
         return slug or "unnamed_task"
 
     # --------------------------------------------------------------- lookup
-    def get_skill(self, name: str) -> Optional[Skill]:
-        """Return the cached skill for a command, or ``None`` if it is novel."""
-        return self._skills.get(self.normalize_name(name))
+    def get_skill(
+        self, name: str, *, require_enabled: bool = False
+    ) -> Optional[Skill]:
+        """Return the cached skill for a command, or ``None`` if it is novel.
+
+        A skill whose template image is gone cannot be replayed, so it is
+        reported as a cache miss (the caller re-plans) instead of failing the
+        reflex path.
+
+        ``require_enabled`` is how the *replay* path asks: reflexes are compiled
+        disabled, so a stored-but-disabled reflex must not take over from the
+        planner. Callers that only want stats (``record_success``) leave it off.
+        """
+        skill = self._skills.get(self.normalize_name(name))
+        if skill is None:
+            return None
+        if require_enabled and not bool(getattr(skill, "enabled", False)):
+            logger.info(
+                "Skill %r is disabled; treating it as a cache miss.", skill.name
+            )
+            return None
+        if not _template_exists(skill):
+            logger.warning(
+                "Ignoring cached skill %r: template %s is missing; re-planning.",
+                skill.name,
+                skill.template_path,
+            )
+            return None
+        return skill
+
+    def set_enabled(self, name: str, enabled: bool) -> bool:
+        """Turn one reflex on or off in the cache. Returns False if unknown."""
+        skill = self._skills.get(self.normalize_name(name))
+        if skill is None:
+            return False
+        skill.enabled = bool(enabled)
+        self._save()
+        logger.info("Reflex %r is now %s.", skill.name, "enabled" if enabled else "disabled")
+        return True
+
+    def set_all_enabled(self, enabled: bool) -> int:
+        """Turn every reflex on or off at once; returns how many changed."""
+        changed = 0
+        for skill in self._skills.values():
+            if bool(getattr(skill, "enabled", False)) != bool(enabled):
+                skill.enabled = bool(enabled)
+                changed += 1
+        if changed:
+            self._save()
+        return changed
 
     def has_skill(self, name: str) -> bool:
         """Return True if a compiled skill already exists for the command."""
@@ -78,6 +131,30 @@ class MemoryManager:
             self._save()
             return True
         return False
+
+    def clear_all(self, templates_dir: Path | None = None) -> int:
+        """Remove every compiled reflex and its generated template files."""
+        removed = 0
+        for skill in self._skills.values():
+            template = Path(str(skill.template_path or ""))
+            if template.is_file():
+                try:
+                    template.unlink()
+                    removed += 1
+                except OSError:
+                    logger.warning("Could not remove reflex template %s", template)
+        # Executor-only anchor crops are not referenced by the memory JSON but
+        # are still generated cache artifacts.
+        generated_dir = Path(templates_dir) if templates_dir is not None else self._memory_file.parent
+        for template in generated_dir.glob("*.auto.png"):
+            try:
+                template.unlink()
+                removed += 1
+            except OSError:
+                logger.warning("Could not remove generated anchor %s", template)
+        self._skills.clear()
+        self._save()
+        return removed
 
     # ---------------------------------------------------------- persistence
     def _load(self) -> None:

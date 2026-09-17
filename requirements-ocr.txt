@@ -1,6 +1,13 @@
-# Optional: PaddleOCR text grounding for the multi-step task pipeline.
-# Install with: pip install -r requirements-ocr.txt
-# PaddleOCR is heavy (~1 GB with model downloads); the pipeline degrades
-# gracefully to icon matching + screenshot reasoning when it is absent.
-paddleocr>=3.0
-paddlepaddle>=3.0
+# Fast OCR text grounding for the multi-step task pipeline.
+# RapidOCR uses compact ONNX models and avoids the Paddle runtime overhead.
+# 1.3+ declares python_requires <3.13, so on Python 3.13 pip resolves 1.2.3;
+# the floor stays low so the install works on every supported interpreter.
+rapidocr_onnxruntime>=1.2
+
+# Compatibility backend, used automatically when RapidOCR is not installed.
+# Install these (or set FURTI_OCR_BACKEND=paddle) to keep text grounding on
+# without RapidOCR. It is much slower on CPU than RapidOCR, so prefer the
+# package above; leave FURTI_OCR_MKLDNN alone, because the oneDNN path can
+# fail on some paddlepaddle builds and would disable text detection.
+# paddleocr>=3.0
+# paddlepaddle>=3.0

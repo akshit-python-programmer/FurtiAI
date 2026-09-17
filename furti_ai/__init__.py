@@ -7,7 +7,7 @@ milliseconds by :class:`VisionReflex`. The :class:`AgentOrchestrator` wires the
 fallback loop together.
 
 The multi-step task pipeline (:class:`TaskAgent`) extends this with
-transparent planning, PaddleOCR + icon grounding, a status window, a kill
+transparent planning, RapidOCR + cached icon grounding, a status window, a kill
 hotkey, token/cost tracking and per-task ``<task_name>.md`` reports.
 """
 
@@ -19,7 +19,7 @@ from .controller import InputController, PyAutoGuiInput
 from .cost import CostSummary, UsageTracker
 from .executor import ExecutionReport, PlanExecutor, StepResult
 from .memory import MemoryManager
-from .models import ActionPlan, ActionType, BoundingBox, Skill
+from .models import ActionPlan, ActionType, BoundingBox, Skill, coerce_action
 from .ocr import IconMatch, IconMatcher, TextDetector, TextLine
 from .orchestrator import AgentOrchestrator, build_agent, build_task_agent
 from .planner import PlanStep, TaskPlan, TaskPlanner
@@ -27,6 +27,7 @@ from .screen import PyAutoGuiScreen, ScreenCapture
 from .status import KillSwitch, StatusWindow
 from .tasklog import TaskJournal
 from .vision import VisionReflex
+from .windows import find_window, focus_window, list_windows, set_process_dpi_aware
 
 __all__ = [
     "ActionPlan",
@@ -34,6 +35,7 @@ __all__ = [
     "AgentOrchestrator",
     "BoundingBox",
     "BrainPlanner",
+    "coerce_action",
     "CostSummary",
     "DeepSeekClient",
     "ExecutionReport",
@@ -67,4 +69,8 @@ __all__ = [
     "VisualContextManager",
     "build_agent",
     "build_task_agent",
+    "find_window",
+    "focus_window",
+    "list_windows",
+    "set_process_dpi_aware",
 ]

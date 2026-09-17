@@ -15,6 +15,7 @@ full replay afterwards in the markdown file.
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -203,12 +204,18 @@ class TaskJournal:
     # ---------------------------------------------------------------- report
     def report_path(self) -> Path:
         safe = (
-            self.task_name.replace("/", "_")
-            .replace("\\", "_")
+            re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", self.task_name)
             .replace(" ", "_")
-            .strip("_")
+            .strip("._ ")
             or "task"
         )
+        safe = safe[:120].rstrip("._ ") or "task"
+        if safe.upper() in {"CON", "PRN", "AUX", "NUL"} or (
+            len(safe) == 4
+            and safe[:3].upper() in {"COM", "LPT"}
+            and safe[3].isdigit()
+        ):
+            safe = f"task_{safe}"
         return self.reports_dir / f"{safe}.md"
 
     def write_report(self, cost_summary: Any) -> Path:
@@ -278,6 +285,15 @@ class TaskJournal:
                 lines.append(
                     "  - visually verified: "
                     f"`{bool(result.get('visually_verified'))}`"
+                )
+            if result.get("next_step_ready") is not None:
+                lines.append(
+                    "  - next step ready: "
+                    f"`{bool(result.get('next_step_ready'))}`"
+                )
+            if result.get("next_step_note"):
+                lines.append(
+                    f"  - next-step review: {result.get('next_step_note')}"
                 )
             for note in result.get("notes", []):
                 lines.append(f"  - {note}")

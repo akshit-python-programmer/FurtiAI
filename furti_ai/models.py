@@ -19,15 +19,305 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
-class ActionType(str, Enum):
-    """The set of low-level actions a compiled reflex can perform."""
+@dataclass(frozen=True)
+class UserChoiceRequest:
+    """A model-authored question that needs a human answer before continuing."""
 
+    question: str
+    options: tuple[str, ...] = ()
+
+
+class ActionType(str, Enum):
+    """The set of actions a plan step can perform.
+
+    The first group drives the screen through the mouse/keyboard layer and is
+    the only group a compiled reflex (see ``vision.py``) can replay. The second
+    group -- the *direct tools* -- asks the operating system to do the work
+    instead: launching Notepad is one process spawn, not a Run-dialog chord, a
+    window wait, an OCR round trip and a verification call.
+    """
+
+    # ---------------------------------------------------------- screen input
     CLICK = "click"
     DOUBLE_CLICK = "double_click"
     RIGHT_CLICK = "right_click"
+    DRAG = "drag"
     TYPE = "type"
     SCROLL = "scroll"
     KEY_PRESS = "key_press"
+    #: Reposition the cursor at an explicit pixel without pressing a button.
+    MOVE = "move"
+
+    # --------------------------------------------------------- direct tools
+    #: Start an application by name/path instead of hunting its icon.
+    LAUNCH_APP = "launch_app"
+    #: Open a file, folder or URI with the OS's registered handler.
+    OPEN_PATH = "open_path"
+    #: Run a shell command and read its output.
+    RUN_COMMAND = "run_command"
+    #: Write text to a file on disk.
+    WRITE_FILE = "write_file"
+    #: Read a text file so the model can reason about its contents.
+    READ_FILE = "read_file"
+    #: Put text on the clipboard (no Ctrl+C dance needed).
+    SET_CLIPBOARD = "set_clipboard"
+    #: Read the clipboard as text.
+    GET_CLIPBOARD = "get_clipboard"
+    #: Bring an existing window to the foreground by title.
+    FOCUS_WINDOW = "focus_window"
+    #: Enumerate the visible top-level windows and their titles.
+    LIST_WINDOWS = "list_windows"
+    CLOSE_WINDOW = "close_window"
+    MINIMIZE_WINDOW = "minimize_window"
+    MAXIMIZE_WINDOW = "maximize_window"
+    #: Pause for a bounded number of seconds (app startup, page load).
+    WAIT = "wait"
+    #: Capture the screen (or one region of it) and save the image locally.
+    SCREENSHOT = "screenshot"
+    #: File-system work. Doing this through Explorer is dozens of clicks;
+    #: through the OS it is one call.
+    CREATE_FOLDER = "create_folder"
+    LIST_DIR = "list_dir"
+    COPY_PATH = "copy_path"
+    MOVE_PATH = "move_path"
+    DELETE_PATH = "delete_path"
+    FIND_FILES = "find_files"
+    PATH_INFO = "path_info"
+    #: Fetch readable web content without opening a browser or screenshot.
+    SCRAPE_URL = "scrape_url"
+    #: Pause planning and ask the user to resolve an ambiguity.
+    ASK_USER = "ask_user"
+
+
+#: The screen-driving actions a compiled reflex can replay. Kept separate from
+#: :class:`ActionType` so the legacy single-action planner never asks the model
+#: for a tool that has no template to compile.
+REFLEX_ACTIONS: tuple[ActionType, ...] = (
+    ActionType.CLICK,
+    ActionType.DOUBLE_CLICK,
+    ActionType.RIGHT_CLICK,
+    ActionType.DRAG,
+    ActionType.TYPE,
+    ActionType.SCROLL,
+    ActionType.KEY_PRESS,
+    ActionType.MOVE,
+)
+
+
+#: Alternate spellings models emit for the actions above. Vision models rarely
+#: use the exact enum name, and an unrecognised name silently degrades to a
+#: plain click that then fails anchor resolution ("no target anchor found"),
+#: which looks like "the agent ignored my drag/click".
+_ACTION_ALIASES = {
+    "click_at": "click",
+    "clickat": "click",
+    "left_click": "click",
+    "leftclick": "click",
+    "mouse_click": "click",
+    "move_to": "move",
+    "moveto": "move",
+    "mouse_move": "move",
+    "move_mouse": "move",
+    "move_pointer": "move",
+    "position_cursor": "move",
+    "move_cursor": "move",
+    "goto": "move",
+    "go_to": "move",
+    "hover": "move",
+    "hover_over": "move",
+    "mouse_over": "move",
+    "mouseover": "move",
+    "drag_to": "drag",
+    "dragto": "drag",
+    "drag_and_drop": "drag",
+    "doubleclick": "double_click",
+    "rightclick": "right_click",
+    "type_text": "type",
+    "typewrite": "type",
+    "write": "type",
+    "keypress": "key_press",
+    "key": "key_press",
+    "press_key": "key_press",
+    "send_keys": "key_press",
+    "key_combo": "key_press",
+    "hotkey": "key_press",
+    "hot_key": "key_press",
+    "shortcut": "key_press",
+    "wheel": "scroll",
+    "mouse_wheel": "scroll",
+    "scroll_wheel": "scroll",
+    # --- direct tools -------------------------------------------------
+    "open_app": "launch_app",
+    "openapp": "launch_app",
+    "start_app": "launch_app",
+    "startapp": "launch_app",
+    "launch": "launch_app",
+    "launch_application": "launch_app",
+    "run_app": "launch_app",
+    "run_program": "launch_app",
+    "start_program": "launch_app",
+    "open_program": "launch_app",
+    "open_application": "launch_app",
+    "open_file": "open_path",
+    "open_folder": "open_path",
+    "open_directory": "open_path",
+    "open_document": "open_path",
+    "open_url": "open_path",
+    "open_website": "open_path",
+    "browse": "open_path",
+    "browse_to": "open_path",
+    "navigate": "open_path",
+    "navigate_to": "open_path",
+    "visit": "open_path",
+    "run": "run_command",
+    "run_shell": "run_command",
+    "shell": "run_command",
+    "shell_command": "run_command",
+    "exec": "run_command",
+    "execute": "run_command",
+    "execute_command": "run_command",
+    "run_command_line": "run_command",
+    "save_file": "write_file",
+    "create_file": "write_file",
+    "write_text_file": "write_file",
+    "append_file": "write_file",
+    "write_to_file": "write_file",
+    "read_text_file": "read_file",
+    "open_and_read_file": "read_file",
+    "copy_to_clipboard": "set_clipboard",
+    "clipboard_set": "set_clipboard",
+    "set_clipboard_text": "set_clipboard",
+    "copy_text": "set_clipboard",
+    "paste_from_clipboard": "get_clipboard",
+    "clipboard_get": "get_clipboard",
+    "read_clipboard": "get_clipboard",
+    "get_clipboard_text": "get_clipboard",
+    "activate_window": "focus_window",
+    "switch_to_window": "focus_window",
+    "bring_to_front": "focus_window",
+    "bring_window_to_front": "focus_window",
+    "raise_window": "focus_window",
+    "enumerate_windows": "list_windows",
+    "get_windows": "list_windows",
+    "list_open_windows": "list_windows",
+    "quit_window": "close_window",
+    "exit_window": "close_window",
+    "minimize": "minimize_window",
+    "maximize": "maximize_window",
+    "sleep": "wait",
+    "delay": "wait",
+    "pause": "wait",
+    "wait_for": "wait",
+    # --- screenshots --------------------------------------------------
+    "take_screenshot": "screenshot",
+    "takescreenshot": "screenshot",
+    "capture_screenshot": "screenshot",
+    "screenshot_region": "screenshot",
+    "region_screenshot": "screenshot",
+    "screen_capture": "screenshot",
+    "capture_region": "screenshot",
+    "save_screenshot": "screenshot",
+    "crop_screenshot": "screenshot",
+    "snapshot": "screenshot",
+    # --- file system --------------------------------------------------
+    "mkdir": "create_folder",
+    "make_folder": "create_folder",
+    "make_directory": "create_folder",
+    "new_folder": "create_folder",
+    "create_directory": "create_folder",
+    "list_directory": "list_dir",
+    "list_folder": "list_dir",
+    "list_files": "list_dir",
+    "browse_folder": "list_dir",
+    "dir_listing": "list_dir",
+    "copy_file": "copy_path",
+    "copy_folder": "copy_path",
+    "copy_directory": "copy_path",
+    "duplicate_file": "copy_path",
+    "move_file": "move_path",
+    "move_folder": "move_path",
+    "rename_file": "move_path",
+    "rename_path": "move_path",
+    "rename": "move_path",
+    "delete_file": "delete_path",
+    "delete_folder": "delete_path",
+    "remove_file": "delete_path",
+    "remove_path": "delete_path",
+    "search_files": "find_files",
+    "find_file": "find_files",
+    "glob_files": "find_files",
+    "locate_file": "find_files",
+    "file_info": "path_info",
+    "path_exists": "path_info",
+    "stat_path": "path_info",
+    "check_path": "path_info",
+}
+
+#: Decorative tokens models bolt onto an action name. They carry no meaning:
+#: "mouse_move" is a move and "double_click_at" is a double click. Stripping
+#: them keeps an unknown spelling from degrading to a plain click.
+_ACTION_PREFIXES = ("mouse_", "cursor_", "pointer_")
+_ACTION_SUFFIXES = ("_at", "_to", "_cursor", "_mouse", "_pointer")
+
+
+def _resolve_action_name(name: str) -> Optional["ActionType"]:
+    """Look one spelling up in the alias map and then the enum."""
+    for _ in range(3):
+        alias = _ACTION_ALIASES.get(name)
+        if alias is None:
+            break
+        name = alias
+    try:
+        return ActionType(name)
+    except ValueError:
+        return None
+
+
+def _action_candidates(name: str) -> list[str]:
+    """Expand a spelling into alias-free variants, most literal first."""
+    candidates = [name]
+    known = {name}
+    for _ in range(3):
+        additions: set[str] = set()
+        for candidate in candidates:
+            for prefix in _ACTION_PREFIXES:
+                if candidate.startswith(prefix) and len(candidate) > len(prefix):
+                    additions.add(candidate[len(prefix) :])
+            for suffix in _ACTION_SUFFIXES:
+                if candidate.endswith(suffix) and len(candidate) > len(suffix):
+                    additions.add(candidate[: -len(suffix)])
+        additions -= known
+        if not additions:
+            break
+        candidates.extend(sorted(additions))
+        known |= additions
+    # Natural-language spellings such as "move_the_mouse" are resolved by their
+    # leading verb, which stays the least trusted candidate.
+    head = name.split("_", 1)[0]
+    if head and head not in candidates:
+        candidates.append(head)
+    return candidates
+
+
+def coerce_action(value: Any, default: Optional["ActionType"] = None) -> Optional["ActionType"]:
+    """Map a model-supplied action string onto an :class:`ActionType`.
+
+    Returns ``default`` when the name is missing or unknown so callers stay in
+    control of the fallback instead of the parser guessing.
+    """
+    raw = str(value or "").strip()
+    if "+" in raw:
+        # The model occasionally emits the chord itself ("ctrl+shift+t")
+        # instead of the action name.
+        return ActionType.KEY_PRESS
+    name = raw.lower().replace("-", "_").replace(" ", "_")
+    if not name:
+        return default
+    for candidate in _action_candidates(name):
+        resolved = _resolve_action_name(candidate)
+        if resolved is not None:
+            return resolved
+    return default
 
 
 @dataclass
@@ -56,6 +346,25 @@ class BoundingBox:
         x2 = min(self.x + self.width, width)
         y2 = min(self.y + self.height, height)
         return BoundingBox(x1, y1, max(0, x2 - x1), max(0, y2 - y1))
+
+    @classmethod
+    def from_corners(
+        cls, left: int, top: int, right: int, bottom: int
+    ) -> "BoundingBox":
+        """Build a box from ``[left, top, right, bottom]`` corner pixels.
+
+        Vision models commonly emit corner coordinates despite a schema that
+        asks for ``x/y/width/height``. This is kept separate from
+        :meth:`from_dict` (whose list form means ``[x, y, width, height]`` for
+        callers that construct plans directly) so each shape stays unambiguous.
+        """
+        left, top, right, bottom = (
+            int(left),
+            int(top),
+            int(right),
+            int(bottom),
+        )
+        return cls(left, top, max(0, right - left), max(0, bottom - top))
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | list[Any] | tuple[Any, ...] | None) -> "BoundingBox":
@@ -143,11 +452,10 @@ class ActionPlan:
             logger.warning("Model leaked 'plan_action' into the action field; normalizing to 'click'.")
             raw_action = "click"
 
-        try:
-            action = ActionType(raw_action)
-        except ValueError:
-            # Convert arbitrary invalid model strings into the safest legal
-            # action rather than aborting the whole command loop.
+        # Convert arbitrary invalid model strings into the safest legal action
+        # rather than aborting the whole command loop.
+        action = coerce_action(raw_action)
+        if action is None:
             logger.warning("Unknown action %r from model; defaulting to click.", raw_action)
             action = ActionType.CLICK
 
@@ -177,15 +485,38 @@ class Skill:
     action: ActionType = ActionType.CLICK
     metadata: dict[str, Any] = field(default_factory=dict)
     success_count: int = 0
+    #: Replays that failed to anchor. Feeds the "retire an unusable reflex"
+    #: rule: a stored reflex that keeps missing is worse than no reflex at all,
+    #: because every miss costs a wasted capture before the planner is asked.
+    failure_count: int = 0
+    #: Times the LLM re-anchored this reflex on the live screen.
+    realign_count: int = 0
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     last_used: Optional[str] = None
+    #: New reflexes start **disabled**. A freshly compiled crop has never been
+    #: replayed against a live screen, so it must be opted in from the GUI's
+    #: Reflexes tab before it may take over from the planner.
+    enabled: bool = False
 
     def record_success(self) -> None:
         """Bump usage counters after a reflex fires successfully."""
         self.success_count += 1
         self.last_used = datetime.now(timezone.utc).isoformat()
+
+    def record_failure(self) -> None:
+        """Count a replay that failed to anchor its target."""
+        self.failure_count += 1
+        self.last_used = datetime.now(timezone.utc).isoformat()
+
+    def record_realign(self, template_path: Optional[str] = None) -> None:
+        """Count a successful LLM re-anchoring of this reflex."""
+        self.realign_count += 1
+        self.failure_count = 0  # the stale anchor has been replaced
+        if template_path:
+            self.template_path = template_path
+        self.metadata["realigned_at"] = datetime.now(timezone.utc).isoformat()
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-safe dictionary."""
@@ -202,6 +533,9 @@ class Skill:
             action=ActionType(str(data.get("action", "click")).lower()),
             metadata=data.get("metadata", {}),
             success_count=int(data.get("success_count", 0)),
+            failure_count=int(data.get("failure_count", 0)),
+            realign_count=int(data.get("realign_count", 0)),
             created_at=data.get("created_at", ""),
             last_used=data.get("last_used"),
+            enabled=bool(data.get("enabled", False)),
         )

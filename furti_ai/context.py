@@ -4,7 +4,7 @@
 
 1. throttles captures to at least ``screenshot_min_interval`` seconds apart
    (an absolute guard against screenshot-per-second token burn),
-2. grounds the frame with PaddleOCR text + saved-template icon matching,
+2. grounds the frame with fast RapidOCR text + cached saved-template matching,
 3. asks the LLM -- cheaply, text-only -- whether the *raw screenshot* is
    actually important for this instruction, and only then encodes (downscaled)
    pixels, and
@@ -17,9 +17,9 @@ coordinates the model needs to click things.
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 
 from .config import Settings
+from .jsoncontract import extract_json_object
 from .ocr import IconMatch, IconMatcher, TextDetector, TextLine, describe_scene
 from .screen import ScreenCapture
 
@@ -119,7 +120,7 @@ MIN_FORCE_INTERVAL = 1.0
 
 
 class VisualContextManager:
-    """Throttled screen capture + OCR + icon grounding + screenshot gate."""
+    """Throttled capture + parallel fast grounding + screenshot gate."""
 
     def __init__(
         self,
@@ -145,7 +146,13 @@ class VisualContextManager:
         self._cached_text: list[TextLine] = []
         self._cached_icons: list[IconMatch] = []
         self._gate_cache: dict[str, tuple[bool, str]] = {}
+        self._grounding_failures: set[str] = set()
         self._last_encoded_size: tuple[int, int] = ()
+        self._grounding_pool = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="furti-grounding",
+        )
+        self._closed = False
 
     @property
     def last_capture_ts(self) -> float:
@@ -157,26 +164,57 @@ class VisualContextManager:
         """Local wall-clock time of the most recent screen capture."""
         return self._last_capture_at
 
+    def _capture_due(self, force_fresh: bool) -> bool:
+        """Whether a capture is allowed right now under the throttles."""
+        if self._cached_frame is None:
+            return True
+        elapsed = time.monotonic() - self._last_capture_ts
+        if force_fresh:
+            return elapsed >= MIN_FORCE_INTERVAL
+        return elapsed >= self._settings.screenshot_min_interval
+
     # --------------------------------------------------------------- public
-    def observe(self, instruction: str, force_fresh: bool = False) -> SceneObservation:
+    def observe(
+        self,
+        instruction: str,
+        force_fresh: bool = False,
+        include_screenshot: Optional[bool] = None,
+        wait_for_fresh: bool = False,
+    ) -> SceneObservation:
         """Ground the current screen for ``instruction``.
 
         ``force_fresh`` asks for a new capture (used right before acting) but
         still respects the 1-second absolute floor, so the agent can never
         take screenshots faster than once per second.
+
+        ``wait_for_fresh`` waits out that floor instead of returning the
+        cached frame. Post-action review uses it: a frame captured *before*
+        the action cannot prove that the action worked, and silently skipping
+        the review would report an unverified step as a success.
         """
+        if self._closed:
+            raise RuntimeError("visual context manager is closed")
         if self._stop_event is not None and self._stop_event.is_set():
             raise TaskAborted("stop hotkey pressed before screen capture")
 
         fresh = False
-        now = time.monotonic()
-        elapsed = now - self._last_capture_ts
-        if self._cached_frame is None:
-            should_capture = True
-        elif force_fresh:
-            should_capture = elapsed >= MIN_FORCE_INTERVAL
-        else:
-            should_capture = elapsed >= self._settings.screenshot_min_interval
+        should_capture = self._capture_due(force_fresh)
+        if (
+            not should_capture
+            and force_fresh
+            and wait_for_fresh
+            and self._cached_frame is not None
+        ):
+            # Wait out the absolute floor (at most MIN_FORCE_INTERVAL) instead
+            # of handing back the pre-action frame.
+            deadline = self._last_capture_ts + MIN_FORCE_INTERVAL + 0.5
+            while not should_capture and time.monotonic() < deadline:
+                if self._stop_event is not None and self._stop_event.is_set():
+                    raise TaskAborted(
+                        "stop hotkey pressed while waiting for a capture slot"
+                    )
+                time.sleep(0.02)
+                should_capture = self._capture_due(force_fresh)
 
         if should_capture:
             capture_started = time.perf_counter()
@@ -194,15 +232,25 @@ class VisualContextManager:
                     "grounding it with OCR and icon matching."
                 )
             grounding_started = time.perf_counter()
-            self._cached_text = (
-                self._text_detector.detect(self._cached_frame)
-                if self._text_detector is not None and self._text_detector.available
-                else []
+            text_future = self._grounding_pool.submit(
+                self._text_detector.detect,
+                self._cached_frame,
+            ) if (
+                self._text_detector is not None
+                and self._text_detector.available
+            ) else None
+            icon_future = self._grounding_pool.submit(
+                self._icon_matcher.find_icons,
+                self._cached_frame,
+            ) if self._icon_matcher is not None else None
+            self._cached_text = self._read_grounding_result(
+                text_future,
+                "OCR",
             )
-            self._cached_icons = (
-                self._icon_matcher.find_icons(self._cached_frame)
-                if self._icon_matcher is not None
-                else []
+            self._note_text_detection_failure()
+            self._cached_icons = self._read_grounding_result(
+                icon_future,
+                "icon matching",
             )
             logger.debug(
                 "Fresh capture: %s, %d OCR lines, %d icon matches.",
@@ -226,7 +274,20 @@ class VisualContextManager:
                     len(self._cached_icons),
                 )
 
-        use_screenshot, reason = self._decide_vision(instruction)
+        if include_screenshot is True:
+            # Post-step review explicitly requests the image, but only attach
+            # a frame captured after the action. Never resend a pre-action
+            # cached frame as if it were current.
+            use_screenshot = fresh
+            reason = (
+                "post-step review requested visual evidence"
+                if fresh
+                else "post-step review has no fresh frame; use text grounding"
+            )
+        elif include_screenshot is False:
+            use_screenshot, reason = False, "caller requested text grounding only"
+        else:
+            use_screenshot, reason = self._decide_vision(instruction)
         image_b64: Optional[str] = None
         frame_size = (
             (int(self._cached_frame.shape[1]), int(self._cached_frame.shape[0]))
@@ -252,8 +313,72 @@ class VisualContextManager:
             vision_size=vision_size,
         )
 
+    def _read_grounding_result(self, future: Any, label: str) -> list[Any]:
+        """Return optional grounding output without hiding backend failures."""
+        if future is None:
+            return []
+        try:
+            result = future.result()
+        except Exception as exc:
+            logger.warning("%s failed for this frame: %s", label, exc)
+            if label not in self._grounding_failures:
+                self._grounding_failures.add(label)
+                if self._journal is not None:
+                    # A broken grounding backend removes anchors silently
+                    # otherwise; report it once per task instead of per frame.
+                    self._journal.warn(
+                        f"{label} is failing on every frame ({exc}); "
+                        "target anchoring is degraded for this task."
+                    )
+            return []
+        return list(result or [])
+
+    def _note_text_detection_failure(self) -> None:
+        """Report an OCR backend that died mid-task, once per task.
+
+        A backend that fails on every frame would otherwise leave the agent
+        with no text anchors and no explanation in the report.
+        """
+        detector = self._text_detector
+        if (
+            self._journal is None
+            or detector is None
+            or not getattr(detector, "runtime_failure", "")
+            or "text detection" in self._grounding_failures
+        ):
+            return
+        self._grounding_failures.add("text detection")
+        self._journal.warn(
+            f"text detection failed on every frame ({detector.runtime_failure}); "
+            "OCR is disabled and target anchoring is degraded for this task."
+        )
+
+    def observe_for_review(
+        self,
+        instruction: str,
+        force_fresh: bool = True,
+    ) -> SceneObservation:
+        """Observe a post-action state and attach pixels when freshly captured.
+
+        The capture floor is awaited rather than skipped: a step can only be
+        verified against a frame that was taken after its action.
+        """
+        return self.observe(
+            instruction,
+            force_fresh=force_fresh,
+            include_screenshot=True,
+            wait_for_fresh=True,
+        )
+
     def last_scene_text(self) -> str:
         return describe_scene(self._cached_text, self._cached_icons)
+
+    def close(self) -> None:
+        """Stop the short-lived grounding workers after a task completes."""
+        if self._closed:
+            return
+        self._closed = True
+        self._grounding_pool.shutdown(wait=True, cancel_futures=True)
 
     # ---------------------------------------------------------------- gating
     def _decide_vision(self, instruction: str) -> tuple[bool, str]:
@@ -285,7 +410,7 @@ class VisualContextManager:
                         getattr(self._llm, "_model", type(self._llm).__name__),
                         "visual_gate",
                     )
-                payload = json.loads(_strip_fences(raw))
+                payload = extract_json_object(raw)
                 use = bool(payload.get("use_screenshot", False))
                 reason = str(payload.get("reason", ""))
                 result = (use, reason)
@@ -333,10 +458,3 @@ class VisualContextManager:
 
 class TaskAborted(Exception):
     """Raised when the kill hotkey / stop button aborts a running task."""
-
-
-def _strip_fences(text: str) -> str:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-    return cleaned

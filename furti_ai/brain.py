@@ -13,18 +13,19 @@ touching the rest of the system.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import logging
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 import cv2
 import numpy as np
 
 from .config import Settings
 from .memory import MemoryManager
-from .models import ActionPlan, ActionType, Skill
+from .models import REFLEX_ACTIONS, ActionPlan, Skill
 from .screen import ScreenCapture
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,10 @@ def _plan_tool_schema() -> dict[str, Any]:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": [a.value for a in ActionType],
+                        # Only screen actions: this planner compiles its single
+                        # action into a template reflex, which a direct tool
+                        # (launch_app, run_command, ...) has no template for.
+                        "enum": [a.value for a in REFLEX_ACTIONS],
                         "description": "Low-level action to perform.",
                     },
                     "bbox": {
@@ -109,6 +113,28 @@ def _plan_tool_schema() -> dict[str, Any]:
     }
 
 
+def _is_json_mode_rejection(exc: Exception) -> bool:
+    """True when an error looks like a rejection of the JSON response mode.
+
+    Used by both clients to decide whether dropping the JSON hint is a useful
+    retry. The match is deliberately narrow -- the words the providers use when
+    they do not implement it -- so an unrelated failure (a rejected image
+    payload, a network error) is not retried twice for nothing.
+    """
+    message = str(exc).lower()
+    return any(
+        hint in message
+        for hint in (
+            "response_format",
+            "response_mime_type",
+            "json_object",
+            "json mode",
+            "structured output",
+            "response schema",
+        )
+    )
+
+
 class DeepSeekClient:
     """OpenAI-SDK client pointed at DeepSeek's OpenAI-compatible endpoint.
 
@@ -124,8 +150,11 @@ class DeepSeekClient:
         settings: Settings,
         model: str | None = None,
         usage_callback=None,
+        api_key: str | None = None,
+        thinking: bool | None = None,
     ) -> None:
-        if not settings.deepseek_api_key:
+        selected_key = api_key or settings.deepseek_api_key
+        if not selected_key:
             raise ValueError(
                 "DEEPSEEK_API_KEY is not set. Export it or pass it via Settings."
             )
@@ -138,10 +167,15 @@ class DeepSeekClient:
 
         self._settings = settings
         self._client = OpenAI(
-            api_key=settings.deepseek_api_key,
+            api_key=selected_key,
             base_url=settings.deepseek_base_url,
         )
         self._model = model or settings.deepseek_model
+        #: Thinking mode is per client, not global: one client can be the deep
+        #: escalation brain while the routine planner/reviewer keeps tools.
+        self.thinking = (
+            bool(settings.deepseek_thinking_mode) if thinking is None else bool(thinking)
+        )
         self.usage_callback = usage_callback
         self.call_count = 0
 
@@ -163,7 +197,7 @@ class DeepSeekClient:
             "temperature": 0.0,
         }
 
-        if use_tools and self._settings.deepseek_use_function_calling and not self._settings.deepseek_thinking_mode:
+        if use_tools and self._settings.deepseek_use_function_calling and not self.thinking:
             kwargs["tools"] = [_plan_tool_schema()]
             kwargs["tool_choice"] = {
                 "type": "function",
@@ -237,14 +271,19 @@ class DeepSeekClient:
 
     # ----------------------------------------------- multi-step task support
     def chat_text(self, system: str, user: str, purpose: str = "") -> str:
-        """Plain text completion; returns the raw assistant string."""
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.0,
+        """Plain text completion; returns the raw assistant string.
+
+        Every caller of this entry point expects a JSON control payload, so the
+        request asks the endpoint for JSON mode (DeepSeek's OpenAI-compatible
+        ``response_format``). Endpoints that do not implement it are retried
+        without the hint rather than failing the step.
+        """
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        response = self._create_json(
+            {"model": self._model, "messages": messages, "temperature": 0.0}
         )
         self._record_usage(response, purpose)
         return self._content_to_str(response.choices[0].message.content)
@@ -264,13 +303,37 @@ class DeepSeekClient:
                 ],
             },
         ]
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            temperature=0.0,
+        response = self._create_json(
+            {"model": self._model, "messages": messages, "temperature": 0.0}
         )
         self._record_usage(response, purpose)
         return self._content_to_str(response.choices[0].message.content)
+
+    def _create_json(self, kwargs: dict[str, Any]) -> Any:
+        """Create a completion asking for JSON, retrying without the hint.
+
+        The JSON response format keeps the answer to one parseable object, which
+        is what keeps a control payload from drifting into prose. It is an
+        *optimisation*, though, not a requirement: an endpoint that rejects
+        ``response_format`` (or a model that does not support it) must still be
+        usable, so the rejection is caught and the identical request is sent
+        once more without it.
+        """
+        if not bool(getattr(self._settings, "llm_json_mode", True)):
+            return self._client.chat.completions.create(**kwargs)
+        payload = dict(kwargs)
+        payload["response_format"] = {"type": "json_object"}
+        try:
+            return self._client.chat.completions.create(**payload)
+        except Exception as exc:
+            if not _is_json_mode_rejection(exc):
+                raise
+            logger.warning(
+                "DeepSeek rejected the JSON response format (%s); retrying "
+                "without it. The answer is still parsed strictly.",
+                exc,
+            )
+            return self._client.chat.completions.create(**kwargs)
 
     # ---------------------------------------------------------------- utils
     def _record_usage(self, response: Any, purpose: str) -> None:
@@ -300,7 +363,24 @@ class DeepSeekClient:
 
 
 class GeminiClient:
-    """Google GenAI client adapter that returns the same structured plan JSON."""
+    """Google GenAI adapter with the same surface as :class:`DeepSeekClient`.
+
+    Parity notes (the Gemini path used to lag behind the DeepSeek one):
+
+    * the same three entry points -- ``chat_with_vision`` (structured plan),
+      ``chat_text`` and ``chat_vision`` -- with the same signatures and the
+      same ``purpose`` accounting;
+    * real function calling: ``chat_with_vision`` asks for the ``plan_action``
+      tool with ``mode="ANY"`` and parses ``function_call.args``, so the model
+      cannot answer with prose where a plan is required;
+    * a JSON ``response_mime_type`` fallback when function calling is rejected
+      (the DeepSeek client has the same tool-less retry);
+    * both SDK layouts -- ``google-genai`` (``genai.Client``) and the older
+      ``google-generativeai`` (``genai.configure`` + ``GenerativeModel``) --
+      behind one adapter;
+    * usage/cost reporting including thinking tokens, and the same
+      ``call_count`` counter used by the budget guard.
+    """
 
     def __init__(
         self,
@@ -312,24 +392,244 @@ class GeminiClient:
             raise ValueError(
                 "GOOGLE_API_KEY is not set. Export it or pass it via Settings."
             )
+
+        self._settings = settings
+        self._model = model or settings.gemini_model
+        self.usage_callback = usage_callback
+        self.call_count = 0
+        #: ``True`` when the modern ``google-genai`` client is in use.
+        self._modern = False
+        self._types: Any = None
+        self._genai: Any = None
+        self._client: Any = None
+        self._legacy_model: Any = None
+
         try:
-            from google import genai
+            from google import genai  # modern SDK
             from google.genai import types as genai_types
-        except ImportError:  # pragma: no cover
+
+            self._genai = genai
+            self._types = genai_types
+            self._client = genai.Client(api_key=settings.google_api_key)
+            self._modern = True
+        except ImportError:  # pragma: no cover - legacy SDK layout
             try:
                 import google.generativeai as genai  # older SDK layout
-                genai_types = genai.types
+
+                genai.configure(api_key=settings.google_api_key)
+                self._genai = genai
+                self._types = genai.types
+                self._legacy_model = genai.GenerativeModel(self._model)
             except ImportError as exc:
                 raise ImportError(
                     "Install the 'google-genai' package to use GeminiClient."
                 ) from exc
 
-        self._settings = settings
-        self._client = genai.Client(api_key=settings.google_api_key)
-        self._model = model or settings.gemini_model
-        self._genai_types = genai_types
-        self.usage_callback = usage_callback
-        self.call_count = 0
+    # ------------------------------------------------------------ payloads
+    def _build_contents(
+        self, system: str, user: str, image_b64: str | None = None
+    ) -> list[Any]:
+        """Assemble parts for either SDK layout."""
+        image_bytes = base64.b64decode(image_b64) if image_b64 else None
+        if self._modern:
+            contents: list[Any] = []
+            if system:
+                contents.append(self._types.Part.from_text(text=system))
+            if user:
+                contents.append(self._types.Part.from_text(text=user))
+            if image_bytes is not None:
+                contents.append(
+                    self._types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+                )
+            return contents
+        # The legacy SDK accepts plain strings and {"mime_type", "data"} blobs.
+        contents = [part for part in (system, user) if part]
+        if image_bytes is not None:
+            contents.append({"mime_type": "image/png", "data": image_bytes})
+        return contents
+
+    def _build_config(self, use_tools: bool, json_mode: bool = False) -> Any:
+        """Generation config, mirroring ``DeepSeekClient._build_request_kwargs``.
+
+        Gemini has no "thinking mode blocks tools" quirk, so tools stay enabled
+        unless the caller deliberately disables them (or a request fails and is
+        retried without).
+        """
+        if not self._modern:  # legacy SDK: return a plain dict, not a Config
+            config: dict[str, Any] = {"temperature": 0.0}
+            if use_tools:
+                config["tools"] = [self._tool_legacy()]
+            if json_mode:
+                config["response_mime_type"] = "application/json"
+            return config
+
+        kwargs: dict[str, Any] = {"temperature": 0.0}
+        if use_tools:
+            declaration = self._types.FunctionDeclaration(
+                name="plan_action",
+                description=(
+                    "Produce one executable UI action plan from a screenshot."
+                ),
+                parameters=_gemini_schema(self._types),
+            )
+            kwargs["tools"] = [self._types.Tool(function_declarations=[declaration])]
+            kwargs["tool_config"] = self._types.ToolConfig(
+                function_calling_config=self._types.FunctionCallingConfig(
+                    mode="ANY",
+                    allowed_function_names=["plan_action"],
+                )
+            )
+        if json_mode:
+            kwargs["response_mime_type"] = "application/json"
+        return self._types.GenerateContentConfig(**kwargs)
+
+    def _tool_legacy(self) -> Any:
+        """``Tool`` object for the older SDK (same declaration, its own types)."""
+        return self._types.Tool(
+            function_declarations=[
+                self._types.FunctionDeclaration(
+                    name="plan_action",
+                    description=(
+                        "Produce one executable UI action plan from a screenshot."
+                    ),
+                    parameters=_gemini_schema(self._types),
+                )
+            ]
+        )
+
+    def _generate(
+        self,
+        contents: list[Any],
+        *,
+        use_tools: bool = False,
+        json_mode: bool = False,
+    ) -> Any:
+        """Run one generate_content call through either SDK layout."""
+        if self._modern:
+            return self._client.models.generate_content(
+                model=self._model,
+                contents=contents,
+                config=self._build_config(use_tools=use_tools, json_mode=json_mode),
+            )
+        return self._legacy_model.generate_content(
+            contents,
+            generation_config=self._build_config(use_tools=use_tools, json_mode=json_mode),
+        )
+
+    # ------------------------------------------------------------ structured
+    def chat_with_vision(self, prompt: str, image_b64: str) -> dict[str, Any]:
+        """Return a structured action plan (function call, then JSON fallback)."""
+        system = SYSTEM_PROMPT + " Return a JSON object only."
+        wants_tools = bool(getattr(self._settings, "gemini_use_function_calling", True))
+        contents = self._build_contents(system, prompt, image_b64)
+
+        response: Any = None
+        if wants_tools:
+            try:
+                response = self._generate(contents, use_tools=True)
+            except Exception as exc:
+                if not _is_tool_rejection(exc):
+                    raise
+                logger.warning(
+                    "Gemini rejected the tool schema; retrying with a JSON "
+                    "response mode: %s",
+                    exc,
+                )
+        if response is None:
+            try:
+                response = self._generate(contents, json_mode=True)
+            except Exception as exc:
+                logger.warning(
+                    "Gemini JSON-mode request failed; retrying with plain "
+                    "multimodal generation: %s",
+                    exc,
+                )
+                response = self._generate(contents)
+
+        self._record_usage(response, purpose="plan_action")
+
+        args = self._extract_function_args(response)
+        if isinstance(args, dict) and args:
+            return args
+
+        text = self._extract_text(response)
+        cleaned = _strip_code_fences(text)
+        try:
+            payload = json.loads(cleaned)
+        except ValueError as exc:
+            raise ValueError(
+                f"Gemini returned no usable plan JSON: {cleaned[:200]!r}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Gemini returned JSON that is not an object.")
+        return payload
+
+    def _extract_function_args(self, response: Any) -> Optional[dict[str, Any]]:
+        """Pull ``function_call`` arguments out of either SDK's response."""
+        calls = getattr(response, "function_calls", None)
+        if calls:
+            for call in calls:
+                args = getattr(call, "args", None)
+                if args:
+                    return dict(args)
+
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", None) or []:
+                call = getattr(part, "function_call", None)
+                if call is None:
+                    continue
+                args = getattr(call, "args", None)
+                if args:
+                    return dict(args)
+        return None
+
+    # ----------------------------------------------- multi-step task support
+    def chat_text(self, system: str, user: str, purpose: str = "") -> str:
+        """Plain text completion; returns the raw assistant string.
+
+        JSON mode is requested (``response_mime_type``) because every caller
+        parses a control payload out of the answer, and dropped again if the SDK
+        or model rejects it -- the answer is parsed strictly either way.
+        """
+        response = self._generate_json(self._build_contents(system, user))
+        self._record_usage(response, purpose)
+        return self._extract_text(response)
+
+    def chat_vision(
+        self, system: str, user: str, image_b64: str, purpose: str = ""
+    ) -> str:
+        """Vision completion returning raw text (no forced tool schema)."""
+        contents = self._build_contents(system, user, image_b64)
+        try:
+            response = self._generate_json(contents)
+        except Exception as exc:
+            # Same graceful degradation as the DeepSeek client: a rejected
+            # image payload must not kill the step.
+            logger.warning(
+                "Gemini multimodal request failed; retrying text-only: %s", exc
+            )
+            response = self._generate_json(self._build_contents(system, user))
+        self._record_usage(response, purpose)
+        return self._extract_text(response)
+
+    def _generate_json(self, contents: list[Any]) -> Any:
+        """Generate with ``response_mime_type=application/json``, with a fallback."""
+        wants_json = bool(getattr(self._settings, "llm_json_mode", True))
+        if not wants_json:
+            return self._generate(contents)
+        try:
+            return self._generate(contents, json_mode=True)
+        except Exception as exc:
+            if not _is_json_mode_rejection(exc):
+                raise
+            logger.warning(
+                "Gemini rejected the JSON response mode (%s); retrying without "
+                "it. The answer is still parsed strictly.",
+                exc,
+            )
+            return self._generate(contents)
 
     def _extract_text(self, response: Any) -> str:
         """Extract the model answer from the google.genai response object."""
@@ -356,75 +656,6 @@ class GeminiClient:
 
         raise ValueError("The Gemini response did not include a usable content string.")
 
-    def chat_with_vision(self, prompt: str, image_b64: str) -> dict[str, Any]:
-        image_data = base64.b64decode(image_b64)
-
-        # Use the new google.genai Part API, with the screenshot bytes sent as an
-        # image/png attachment and the instruction sent as text parts.
-        contents = [
-            self._genai_types.Part.from_text(
-                text=SYSTEM_PROMPT + " Return a JSON object only."
-            ),
-            self._genai_types.Part.from_text(text=prompt),
-            self._genai_types.Part.from_bytes(data=image_data, mime_type="image/png"),
-        ]
-
-        try:
-            response = self._client.models.generate_content(
-                model=self._model,
-                contents=contents,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Gemini multimodal request failed; retrying with a text-only payload: %s",
-                exc,
-            )
-            response = self._client.models.generate_content(
-                model=self._model,
-                contents=[
-                    self._genai_types.Part.from_text(
-                        text=SYSTEM_PROMPT + " Return a JSON object only."
-                    ),
-                    self._genai_types.Part.from_text(text=prompt),
-                ],
-            )
-
-        self._record_usage(response, purpose="plan_action")
-        text = self._extract_text(response)
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-
-        return json.loads(cleaned)
-
-    # ----------------------------------------------- multi-step task support
-    def chat_text(self, system: str, user: str, purpose: str = "") -> str:
-        """Plain text completion; returns the raw assistant string."""
-        response = self._client.models.generate_content(
-            model=self._model,
-            contents=[
-                self._genai_types.Part.from_text(text=system),
-                self._genai_types.Part.from_text(text=user),
-            ],
-        )
-        self._record_usage(response, purpose)
-        return self._extract_text(response)
-
-    def chat_vision(self, system: str, user: str, image_b64: str, purpose: str = "") -> str:
-        """Vision completion returning raw text (no forced tool schema)."""
-        image_data = base64.b64decode(image_b64)
-        contents = [
-            self._genai_types.Part.from_text(text=system),
-            self._genai_types.Part.from_text(text=user),
-            self._genai_types.Part.from_bytes(data=image_data, mime_type="image/png"),
-        ]
-        response = self._client.models.generate_content(
-            model=self._model,
-            contents=contents,
-        )
-        self._record_usage(response, purpose)
-        return self._extract_text(response)
-
     # ---------------------------------------------------------------- utils
     def _record_usage(self, response: Any, purpose: str) -> None:
         self.call_count += 1
@@ -440,6 +671,54 @@ class GeminiClient:
             )
 
 
+def _strip_code_fences(text: str) -> str:
+    """Remove a ```json fence from a model answer."""
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+    return cleaned
+
+
+def _is_tool_rejection(exc: Exception) -> bool:
+    """True when an endpoint refused the tool/function-calling payload."""
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in ("tool", "function", "tool_choice", "thinking mode")
+    )
+
+
+def _gemini_schema(types_module: Any) -> Any:
+    """Build the ``plan_action`` parameter schema for either Gemini SDK.
+
+    Derived from the OpenAI-style schema so the two providers can never drift
+    apart, with Gemini-specific keys (``additionalProperties``) stripped before
+    the SDK validates it. The modern SDK wants a ``types.Schema``; the legacy
+    SDK accepts the plain OpenAPI-style dict.
+    """
+    schema = _strip_openapi_extras(
+        copy.deepcopy(_plan_tool_schema()["function"]["parameters"])
+    )
+    builder = getattr(types_module, "Schema", None)
+    if builder is None:
+        return schema
+    try:
+        return builder.model_validate(schema)
+    except Exception:  # noqa: BLE001 - the dict form is accepted by older SDKs
+        return schema
+
+
+def _strip_openapi_extras(schema: Any) -> Any:
+    """Drop JSON-Schema keys Gemini's ``Schema`` type does not accept."""
+    if isinstance(schema, dict):
+        for key in ("additionalProperties", "$schema", "default"):
+            schema.pop(key, None)
+        return {key: _strip_openapi_extras(value) for key, value in schema.items()}
+    if isinstance(schema, list):
+        return [_strip_openapi_extras(item) for item in schema]
+    return schema
+
+
 class MockLLMClient:
     """Deterministic stand-in for the reasoning backend.
 
@@ -452,9 +731,11 @@ class MockLLMClient:
         self,
         plan: dict[str, Any] | None = None,
         plan_fn: Callable[[str], dict[str, Any]] | None = None,
+        text: str = "",
     ) -> None:
         self._plan = plan
         self._plan_fn = plan_fn
+        self._text = text
         self.call_count = 0
 
     def chat_with_vision(self, prompt: str, image_b64: str) -> dict[str, Any]:
@@ -468,6 +749,18 @@ class MockLLMClient:
             "bbox": {"x": 320, "y": 260, "width": 160, "height": 80},
             "description": "mock plan: click the centre of the button",
         }
+
+    # The offline demo only needs chat_with_vision, but keeping the mock at
+    # full parity with the real clients means tests can swap it in anywhere.
+    def chat_text(self, system: str, user: str, purpose: str = "") -> str:
+        self.call_count += 1
+        return self._text or json.dumps(self._plan or {})
+
+    def chat_vision(
+        self, system: str, user: str, image_b64: str, purpose: str = ""
+    ) -> str:
+        self.call_count += 1
+        return self._text or json.dumps(self._plan or {})
 
 
 class BrainPlanner:

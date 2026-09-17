@@ -16,7 +16,8 @@ from furti_ai.context import SceneObservation
 from furti_ai.cost import UsageTracker
 from furti_ai.executor import PlanExecutor
 from furti_ai.memory import MemoryManager
-from furti_ai.models import BoundingBox, ActionType
+from furti_ai.models import BoundingBox, ActionType, coerce_action
+from furti_ai.jsoncontract import LLMJsonError
 from furti_ai.ocr import TextLine
 from furti_ai.planner import BudgetExceeded, PlanStep, TaskPlan, TaskPlanner
 from furti_ai.tasklog import TaskJournal
@@ -129,12 +130,17 @@ class AdaptivePlanner(FakePlanner):
 class RecordingInput:
     def __init__(self):
         self.clicks: list[tuple[int, int]] = []
+        self.moves: list[tuple[int, int]] = []
         self.typed: list[str] = []
-        self.pressed: list[str] = []
+        self.pressed: list[tuple[str, int]] = []
         self.scrolls: list[int] = []
+        self.drags: list[tuple[tuple[int, int], tuple[int, int], str, object, object]] = []
 
-    def click(self, x, y, button="left"):
-        self.clicks.append((x, y))
+    def move_to(self, x, y):
+        self.moves.append((x, y))
+
+    def click(self, x, y, button="left", clicks=1):
+        self.clicks.extend((x, y) for _ in range(max(1, int(clicks))))
 
     def double_click(self, x, y):
         self.clicks.append((x, y))
@@ -145,11 +151,16 @@ class RecordingInput:
     def type_text(self, text):
         self.typed.append(text)
 
-    def press_key(self, key):
-        self.pressed.append(key)
+    def press_key(self, key, presses=1):
+        self.pressed.append((key, presses))
 
     def scroll(self, clicks):
         self.scrolls.append(clicks)
+
+    def drag(self, x, y, end_x, end_y, button="left", duration=None, hold_keys=None):
+        self.drags.append(
+            ((x, y), (end_x, end_y), button, duration, tuple(hold_keys or ()))
+        )
 
 
 # ------------------------------------------------------------------ planner
@@ -201,7 +212,47 @@ def test_planner_restores_bbox_from_downscaled_attached_image(tmp_path):
     assert plan.steps[0].bbox == BoundingBox(20, 10, 40, 20)
 
 
-def test_planner_defensive_action_fallback(tmp_path):
+def test_planner_restores_explicit_point_from_downscaled_attached_image(tmp_path):
+    settings = make_settings(tmp_path)
+    llm = MockLLM(
+        response=(
+            '{"steps": [{"description": "Click the canvas", "action": "click_at", '
+            '"x": 10, "y": 5, "bbox_coordinate_space": "attached_image"}]}'
+        )
+    )
+    scene = SceneObservation(
+        frame=np.zeros((100, 200, 3), dtype=np.uint8),
+        image_b64="encoded",
+        vision_used=True,
+        frame_size=(200, 100),
+        vision_size=(100, 50),
+    )
+    planner = TaskPlanner(
+        llm,
+        settings,
+        make_journal(tmp_path),
+        FakeContext([scene]),
+        threading.Event(),
+    )
+
+    plan = planner.plan("click the canvas")
+
+    step = plan.steps[0]
+    # The model answered in attached-image pixels; acting on them unscaled
+    # would click half the intended distance.
+    assert (step.params["x"], step.params["y"]) == (20, 10)
+    assert step.params["point_coordinate_space"] == "full_capture"
+    assert step.action is ActionType.CLICK
+
+
+def test_planner_refuses_an_unknown_action_instead_of_guessing(tmp_path):
+    """An unmapped action name must not silently become a click.
+
+    The old behaviour fell back to ``ActionType.CLICK``, which turned any
+    hallucinated action ("teleport", "hover_menu", ...) into a real button press
+    at whatever anchor the step carried. The planner now rejects the payload,
+    escalates to the smarter model, and only gives up if that fails too.
+    """
     settings = make_settings(tmp_path)
     llm = MockLLM(
         response='{"steps": [{"description": "x", "action": "teleport", "target": null}]}'
@@ -211,8 +262,27 @@ def test_planner_defensive_action_fallback(tmp_path):
         FakeContext([SceneObservation(frame=np.zeros((8, 8, 3), dtype=np.uint8))]),
         threading.Event(),
     )
-    plan = planner.plan("do the thing")
-    assert plan.steps[0].action == ActionType.CLICK  # safe default
+
+    with pytest.raises(RuntimeError, match="unknown action 'teleport'"):
+        planner.plan("do the thing")
+
+
+def test_planner_escalates_an_unknown_action_to_the_smart_model(tmp_path):
+    settings = make_settings(tmp_path)
+    fast = MockLLM(
+        response='{"steps": [{"description": "x", "action": "teleport"}]}',
+        name="fast-mock",
+    )
+    smart = MockLLM(response=PLAN_JSON, name="smart-mock")
+    planner = TaskPlanner(
+        fast, settings, make_journal(tmp_path), FakeContext([]),
+        threading.Event(), smart_llm=smart,
+    )
+
+    plan = planner.plan("click export then type hello")
+
+    assert plan.steps  # recovered with a valid plan from the smarter model
+    assert smart.call_count == 1
 
 
 def test_planner_escalates_to_smart_model(tmp_path):
@@ -259,6 +329,166 @@ def test_plan_step_signature_stable_and_sensitive():
     c = PlanStep(1, "Click the button", ActionType.DOUBLE_CLICK, target="btn")
     assert a.signature() == b.signature()
     assert a.signature() != c.signature()
+
+
+def test_plan_step_parses_corner_list_bbox():
+    # Vision models frequently ignore the dict schema and return
+    # [left, top, right, bottom] corner pixels instead of x/y/width/height.
+    step = PlanStep.from_dict(
+        {"description": "click chrome", "action": "click",
+         "target": "Chrome", "bbox": [100, 50, 160, 90]},
+        0,
+    )
+    assert step.bbox == BoundingBox(100, 50, 60, 40)
+
+
+def test_plan_step_ignores_malformed_corner_list():
+    step = PlanStep.from_dict(
+        {"description": "click chrome", "action": "click",
+         "target": "Chrome", "bbox": [100, 50, 40, 30]},
+        0,
+    )
+    # right <= left means the "corners" reading is nonsense; drop the box.
+    assert step.bbox is None
+
+
+def test_plan_step_parses_window_title():
+    step = PlanStep.from_dict(
+        {"description": "type the note", "action": "type",
+         "text": "hello", "params": {"window": "Notepad"}},
+        0,
+    )
+    assert step.window == "Notepad"
+    assert step.params["window"] == "Notepad"
+
+    # A top-level "window" field is also honoured.
+    step = PlanStep.from_dict(
+        {"description": "press enter", "action": "key_press",
+         "params": {"key": "enter"}, "window": "Notepad"},
+        0,
+    )
+    assert step.window == "Notepad"
+
+
+# ------------------------------------------------------- action vocabulary
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("click", ActionType.CLICK),
+        ("click_at", ActionType.CLICK),
+        ("left_click", ActionType.CLICK),
+        ("move_to", ActionType.MOVE),
+        ("Move", ActionType.MOVE),
+        ("hover", ActionType.MOVE),
+        ("drag_to", ActionType.DRAG),
+        ("doubleclick", ActionType.DOUBLE_CLICK),
+        ("right_click", ActionType.RIGHT_CLICK),
+        ("type_text", ActionType.TYPE),
+        ("hotkey", ActionType.KEY_PRESS),
+        ("press_key", ActionType.KEY_PRESS),
+        ("ctrl+shift+t", ActionType.KEY_PRESS),
+        ("mouse_wheel", ActionType.SCROLL),
+        # Decorative prefixes/suffixes must not turn a hover into a click.
+        ("mouse_move", ActionType.MOVE),
+        ("move_mouse", ActionType.MOVE),
+        ("MOVE_MOUSE", ActionType.MOVE),
+        ("cursor_move", ActionType.MOVE),
+        ("mouse-move", ActionType.MOVE),
+        ("move the mouse", ActionType.MOVE),
+        ("double_click_at", ActionType.DOUBLE_CLICK),
+        ("mouse_right_click", ActionType.RIGHT_CLICK),
+        ("move_pointer_to", ActionType.MOVE),
+        ("hover_over", ActionType.MOVE),
+        ("mouse_click", ActionType.CLICK),
+    ],
+)
+def test_model_action_names_coerce_to_canonical_actions(raw, expected):
+    assert coerce_action(raw) is expected
+
+
+def test_decorated_spellings_never_silently_become_a_click():
+    # The old parser mapped every unknown name onto the caller's default, so a
+    # model saying "mouse_move" produced a real click instead of a hover.
+    for raw in ("mouse_move", "move_mouse", "cursor_move", "move_pointer_to"):
+        assert coerce_action(raw, ActionType.CLICK) is not ActionType.CLICK
+
+
+def test_unknown_actions_fall_back_to_the_supplied_default():
+    assert coerce_action("teleport", ActionType.CLICK) is ActionType.CLICK
+    assert coerce_action(None) is None
+    assert coerce_action("") is None
+
+
+def test_plan_step_accepts_an_aliased_action_name():
+    step = PlanStep.from_dict(
+        {"description": "hover the menu", "action": "move_to", "x": 10, "y": 20},
+        0,
+    )
+
+    assert step.action is ActionType.MOVE
+    assert (step.params["x"], step.params["y"]) == (10, 20)
+
+
+def test_plan_step_reads_points_from_every_supported_shape():
+    top_level = PlanStep.from_dict(
+        {"description": "click", "action": "click", "x": 12, "y": 34}, 0
+    )
+    point_object = PlanStep.from_dict(
+        {"description": "click", "action": "click", "point": {"x": 56, "y": 78}}, 0
+    )
+    pair = PlanStep.from_dict(
+        {"description": "click", "action": "click", "point": [90, 100]}, 0
+    )
+
+    assert (top_level.params["x"], top_level.params["y"]) == (12, 34)
+    assert (point_object.params["x"], point_object.params["y"]) == (56, 78)
+    assert (pair.params["x"], pair.params["y"]) == (90, 100)
+
+
+def test_plan_step_reads_a_corner_box_given_as_a_point_as_its_centre():
+    step = PlanStep.from_dict(
+        {"description": "click", "action": "click", "point": [10, 20, 30, 40]}, 0
+    )
+
+    assert (step.params["x"], step.params["y"]) == (20, 30)
+
+
+def test_params_point_wins_only_when_no_top_level_pixel_exists():
+    step = PlanStep.from_dict(
+        {
+            "description": "click",
+            "action": "click",
+            "params": {"x": 1, "y": 2, "point": {"x": 3, "y": 4}},
+        },
+        0,
+    )
+
+    assert (step.params["x"], step.params["y"]) == (1, 2)
+
+
+def test_describe_renders_move_and_coordinate_steps():
+    plan = TaskPlan(
+        task_name="t",
+        goal="g",
+        steps=[
+            PlanStep(
+                index=1,
+                description="Hover the toolbar",
+                action=ActionType.MOVE,
+                params={"x": 40, "y": 60},
+            ),
+            PlanStep(
+                index=2,
+                description="Park the cursor",
+                action=ActionType.MOVE,
+            ),
+        ],
+    )
+
+    rendered = plan.describe()
+
+    assert "to (40, 60)" in rendered
+    assert "to current cursor" in rendered
 
 
 # --------------------------------------------------------------------- cost
@@ -317,6 +547,444 @@ def test_executor_resolves_ocr_anchor_and_click(tmp_path):
     # a template was saved and a reflex compiled into memory
     assert memory.has_skill("click_export")
     assert list(settings.templates_dir.glob("*.png"))
+
+
+# ------------------------------------------- rule 1: focus before typing
+TYPED_FIELD_PLAN_JSON = """```json
+{
+  "goal": "Search for invoices",
+  "reasoning": "Type the query into the search box.",
+  "requires_smart_model": false,
+  "steps": [
+    {"description": "Type the query into the search box", "action": "type",
+     "target": "Search", "text": "invoices", "params": {"window": "Chrome"}}
+  ]
+}
+```"""
+
+PRECLICKED_FIELD_PLAN_JSON = """```json
+{
+  "goal": "Search for invoices",
+  "reasoning": "Click the box, then type.",
+  "requires_smart_model": false,
+  "steps": [
+    {"description": "Click the search box", "action": "click",
+     "target": "Search"},
+    {"description": "Type the query", "action": "type",
+     "target": "Search", "text": "invoices"}
+  ]
+}
+```"""
+
+
+def make_plan_from(tmp_path, plan_json: str):
+    """Run one planning pass over a canned model response."""
+    settings = make_settings(tmp_path)
+    journal = make_journal(tmp_path)
+    planner = TaskPlanner(
+        MockLLM(response=plan_json),
+        settings,
+        journal,
+        FakeContext(
+            [SceneObservation(frame=np.zeros((10, 10, 3), dtype=np.uint8))]
+        ),
+        threading.Event(),
+    )
+    return planner.plan("search for invoices"), journal
+
+
+def test_plan_split_the_focus_click_out_of_a_typed_field(tmp_path):
+    plan, journal = make_plan_from(tmp_path, TYPED_FIELD_PLAN_JSON)
+
+    assert [step.action for step in plan.steps] == [ActionType.CLICK, ActionType.TYPE]
+    assert [step.index for step in plan.steps] == [1, 2]
+    # The click keeps the field anchor (and its window) so it is still resolved
+    # on the live screen, exactly like the type step it protects.
+    assert plan.steps[0].target == "Search"
+    assert plan.steps[0].window == "Chrome"
+    assert plan.steps[1].text == "invoices"
+    assert "focus" in plan.steps[0].description.lower()
+    thoughts = [
+        event.message for event in journal._events if event.kind == "THOUGHT"
+    ]
+    assert any("Focus-before-typing rule" in message for message in thoughts)
+
+
+def test_plan_does_not_add_a_second_click_when_one_is_already_planned(tmp_path):
+    plan, _journal = make_plan_from(tmp_path, PRECLICKED_FIELD_PLAN_JSON)
+
+    assert [step.action for step in plan.steps] == [ActionType.CLICK, ActionType.TYPE]
+    assert len(plan.steps) == 2
+
+
+def test_plan_leaves_a_targetless_type_step_alone(tmp_path):
+    # PLAN_JSON's type step has target=None: it types into the focused control
+    # on purpose, so nothing is inserted for it.
+    plan, _journal = make_plan_from(tmp_path, PLAN_JSON)
+
+    assert [step.action for step in plan.steps] == [ActionType.CLICK, ActionType.TYPE]
+    assert len(plan.steps) == 2
+
+
+# ------------------------------------- rule: strict control JSON contract
+def test_plan_step_refuses_an_unknown_action():
+    with pytest.raises(LLMJsonError, match="unknown action 'teleport'"):
+        PlanStep.from_dict({"description": "x", "action": "teleport"}, 1)
+
+
+def test_plan_step_refuses_a_missing_action():
+    with pytest.raises(LLMJsonError, match="unknown action"):
+        PlanStep.from_dict({"description": "x"}, 1)
+
+
+def test_plan_step_still_accepts_documented_alias_spellings():
+    step = PlanStep.from_dict(
+        {"description": "move there", "action": "mouse_move", "x": 10, "y": 20}, 1
+    )
+
+    assert step.action is ActionType.MOVE
+    assert step.params["x"] == 10
+
+
+def test_plan_step_refuses_negative_pixels():
+    with pytest.raises(LLMJsonError, match="below the allowed minimum"):
+        PlanStep.from_dict(
+            {"description": "click", "action": "click", "x": -40, "y": 10}, 1
+        )
+
+
+def test_plan_step_refuses_a_non_numeric_pixel():
+    with pytest.raises(LLMJsonError, match="must be a number"):
+        PlanStep.from_dict(
+            {"description": "click", "action": "click", "x": "left", "y": 10}, 1
+        )
+
+
+def test_plan_step_refuses_an_absurd_pixel():
+    with pytest.raises(LLMJsonError, match="above the allowed maximum"):
+        PlanStep.from_dict(
+            {"description": "click", "action": "click", "x": 500000, "y": 10}, 1
+        )
+
+
+def test_executor_refuses_a_target_that_is_off_screen(tmp_path, monkeypatch):
+    """A resolved point outside the virtual desktop is never dispatched.
+
+    This is the payload-level version of the same worry: if a mis-scaled or
+    hallucinated pixel reaches dispatch, the cursor is thrown off-screen and
+    every later click lands somewhere unintended.
+    """
+    import furti_ai.executor as executor_module
+
+    settings = make_settings(tmp_path, verify_steps=False, max_step_retries=0)
+    settings.ensure_dirs()
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    context = FakeContext([make_scene(frame, [])])
+    input_ctl = RecordingInput()
+    memory = MemoryManager(settings.memory_file)
+    journal = make_journal(tmp_path)
+    planner = TaskPlanner(MockLLM(), settings, journal, context, threading.Event())
+    executor = PlanExecutor(
+        settings, journal, None, input_ctl, memory, planner, context,
+        threading.Event(), "t",
+    )
+    monkeypatch.setattr(
+        executor_module, "virtual_screen_rect", lambda: (0, 0, 300, 200)
+    )
+    plan = TaskPlan(
+        task_name="t",
+        goal="",
+        steps=[
+            _step(
+                description="Click at the far corner",
+                params={"x": 4000, "y": 3000},
+            )
+        ],
+    )
+
+    report = executor.execute("click far away", plan)
+
+    assert not report.success
+    assert input_ctl.clicks == []
+    assert input_ctl.moves == []
+    assert any(
+        "outside the screen" in note for note in report.results[0].notes
+    )
+
+
+def test_plan_step_refuses_a_negative_bbox_size():
+    with pytest.raises(LLMJsonError, match="is negative"):
+        PlanStep.from_dict(
+            {
+                "description": "click",
+                "action": "click",
+                "bbox": {"x": 10, "y": 10, "width": -5, "height": 5},
+            },
+            1,
+        )
+
+
+def test_plan_step_refuses_a_bbox_with_junk_numbers():
+    with pytest.raises(LLMJsonError, match="bbox must contain integer"):
+        PlanStep.from_dict(
+            {
+                "description": "click",
+                "action": "click",
+                "bbox": {"x": "a", "y": 1, "width": 5, "height": 5},
+            },
+            1,
+        )
+
+
+def test_plan_step_treats_a_zero_bbox_as_no_bbox():
+    """The documented placeholder must stay a placeholder, not an error."""
+    step = PlanStep.from_dict(
+        {
+            "description": "click save",
+            "action": "click",
+            "target": "Save",
+            "bbox": {"x": 0, "y": 0, "width": 0, "height": 0},
+        },
+        1,
+    )
+
+    assert step.bbox is None
+
+
+def test_plan_step_refuses_a_type_without_text():
+    with pytest.raises(LLMJsonError, match="must carry the text"):
+        PlanStep.from_dict(
+            {
+                "description": "type the query",
+                "action": "type",
+                "target": "Search",
+                "text": "   ",
+            },
+            1,
+        )
+
+
+def test_plan_step_reads_text_from_params_too():
+    step = PlanStep.from_dict(
+        {"description": "type", "action": "type", "params": {"text": "hello"}}, 1
+    )
+
+    assert step.text == "hello"
+
+
+def test_plan_step_refuses_a_params_that_is_not_an_object():
+    with pytest.raises(LLMJsonError, match="params must be a JSON object"):
+        PlanStep.from_dict(
+            {"description": "click", "action": "click", "params": [1, 2]}, 1
+        )
+
+
+def test_planner_escalates_a_contract_violation_to_the_smart_model(tmp_path):
+    settings = make_settings(tmp_path)
+    fast = MockLLM(
+        response='{"steps": [{"description": "x", "action": "click", "x": -5}]}',
+        name="fast-mock",
+    )
+    smart = MockLLM(response=PLAN_JSON, name="smart-mock")
+    planner = TaskPlanner(
+        fast, settings, make_journal(tmp_path), FakeContext([]),
+        threading.Event(), smart_llm=smart,
+    )
+
+    plan = planner.plan("click export then type hello")
+
+    assert plan.steps
+    assert smart.call_count == 1
+
+
+def test_executor_clicks_a_typed_field_before_typing(tmp_path):
+    """A "type at (x, y)" step must focus the field, not the last window."""
+    settings = make_settings(tmp_path, verify_steps=False, max_step_retries=0)
+    settings.ensure_dirs()
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    line = TextLine("Search", BoundingBox(200, 100, 80, 30), 0.99)
+    context = FakeContext([make_scene(frame, [line])])
+    input_ctl = RecordingInput()
+    memory = MemoryManager(settings.memory_file)
+    journal = make_journal(tmp_path)
+    planner = TaskPlanner(MockLLM(), settings, journal, context, threading.Event())
+    executor = PlanExecutor(
+        settings, journal, None, input_ctl, memory, planner, context,
+        threading.Event(), "t",
+    )
+    plan = TaskPlan(
+        task_name="t",
+        goal="",
+        steps=[
+            _step(
+                action=ActionType.TYPE,
+                text="hello",
+                target="Search",
+                description="Type hello into the search box",
+            )
+        ],
+    )
+
+    report = executor.execute("type hello", plan)
+
+    assert report.success
+    # The click lands on the resolved anchor centre (240, 115) first, so the
+    # keystrokes go to the field rather than whatever had focus.
+    assert input_ctl.clicks == [(240, 115)]
+    assert input_ctl.typed == ["hello"]
+
+
+def test_executor_types_without_clicking_when_no_field_is_named(tmp_path):
+    settings = make_settings(tmp_path, verify_steps=False, max_step_retries=0)
+    settings.ensure_dirs()
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    context = FakeContext([make_scene(frame, [])])
+    input_ctl = RecordingInput()
+    memory = MemoryManager(settings.memory_file)
+    journal = make_journal(tmp_path)
+    planner = TaskPlanner(MockLLM(), settings, journal, context, threading.Event())
+    executor = PlanExecutor(
+        settings, journal, None, input_ctl, memory, planner, context,
+        threading.Event(), "t",
+    )
+    plan = TaskPlan(
+        task_name="t",
+        goal="",
+        steps=[_step(action=ActionType.TYPE, text="hello")],
+    )
+
+    report = executor.execute("type hello", plan)
+
+    assert report.success
+    assert input_ctl.clicks == []  # nothing on screen was named
+    assert input_ctl.typed == ["hello"]
+
+
+def test_executor_dismisses_a_popup_covering_the_target(tmp_path, monkeypatch):
+    """A modal over the target is dismissed before the target is touched."""
+    import furti_ai.executor as executor_module
+
+    settings = make_settings(tmp_path, verify_steps=False, max_step_retries=0)
+    settings.ensure_dirs()
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    export = TextLine("Export", BoundingBox(300, 200, 100, 40), 0.99)
+    close = TextLine("Close", BoundingBox(500, 60, 60, 24), 0.99)
+    context = FakeContext([make_scene(frame, [export, close])])
+    state = {"covered": True}
+
+    class PopupInput(RecordingInput):
+        """Clicking Close really does remove the popup."""
+
+        def click(self, x, y, button="left", clicks=1):
+            super().click(x, y, button, clicks)
+            state["covered"] = False
+
+    input_ctl = PopupInput()
+    memory = MemoryManager(settings.memory_file)
+    journal = make_journal(tmp_path)
+    planner = TaskPlanner(MockLLM(), settings, journal, context, threading.Event())
+    executor = PlanExecutor(
+        settings, journal, None, input_ctl, memory, planner, context,
+        threading.Event(), "t",
+    )
+    monkeypatch.setattr(
+        executor_module, "find_window", lambda title, substring=True: 111
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "window_at",
+        lambda x, y: (999, "Cookie consent")
+        if state["covered"]
+        else (111, "Google Chrome"),
+    )
+    monkeypatch.setattr(executor_module, "window_rect", lambda hwnd: (0, 0, 300, 200))
+    plan = TaskPlan(
+        task_name="t",
+        goal="",
+        steps=[
+            _step(
+                target="Export",
+                description="Click Export",
+                params={"window": "Chrome"},
+            )
+        ],
+    )
+
+    report = executor.execute("click export", plan)
+
+    assert report.success
+    # Close first (530, 72), then the real target once the overlay is gone.
+    assert input_ctl.clicks == [(530, 72), (350, 220)]
+
+
+def test_executor_closes_an_overlay_that_hid_the_target(tmp_path):
+    """A covered target reads as "not found": dismiss, then retry."""
+    settings = make_settings(tmp_path, verify_steps=False, max_step_retries=2)
+    settings.ensure_dirs()
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    close = TextLine("Close", BoundingBox(500, 60, 60, 24), 0.99)
+    export = TextLine("Export", BoundingBox(300, 200, 100, 40), 0.99)
+    context = FakeContext(
+        [
+            make_scene(frame, [close]),  # attempt 1: the overlay hides Export
+            make_scene(frame, [export]),  # after dismissal: Export is reachable
+        ]
+    )
+    input_ctl = RecordingInput()
+    memory = MemoryManager(settings.memory_file)
+    journal = make_journal(tmp_path)
+    planner = TaskPlanner(MockLLM(), settings, journal, context, threading.Event())
+    executor = PlanExecutor(
+        settings, journal, None, input_ctl, memory, planner, context,
+        threading.Event(), "t",
+    )
+    plan = TaskPlan(
+        task_name="t",
+        goal="",
+        steps=[_step(target="Export", description="Click Export")],
+    )
+
+    report = executor.execute("click export", plan)
+
+    assert report.success
+    assert input_ctl.clicks == [(530, 72), (350, 220)]
+
+
+def test_a_planned_focus_click_is_not_repeated_by_the_type_step(tmp_path):
+    """click(field) -> type(field) presses the field once, not twice."""
+    settings = make_settings(tmp_path, verify_steps=False, max_step_retries=0)
+    settings.ensure_dirs()
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    search = TextLine("Search", BoundingBox(200, 100, 80, 30), 0.99)
+    context = FakeContext([make_scene(frame, [search])])
+    input_ctl = RecordingInput()
+    memory = MemoryManager(settings.memory_file)
+    journal = make_journal(tmp_path)
+    planner = TaskPlanner(MockLLM(), settings, journal, context, threading.Event())
+    executor = PlanExecutor(
+        settings, journal, None, input_ctl, memory, planner, context,
+        threading.Event(), "t",
+    )
+    plan = TaskPlan(
+        task_name="t",
+        goal="",
+        steps=[
+            _step(target="Search", description="Click Search to focus it"),
+            _step(
+                index=2,
+                action=ActionType.TYPE,
+                target="Search",
+                text="invoices",
+                description="Type the query",
+            ),
+        ],
+    )
+
+    report = executor.execute("type the query", plan)
+
+    assert report.success
+    assert input_ctl.clicks == [(240, 115)]  # the focus click, exactly once
+    assert input_ctl.typed == ["invoices"]
 
 
 def test_executor_maps_capture_anchor_to_input_coordinates(tmp_path):
@@ -411,7 +1079,241 @@ def test_executor_does_not_match_one_letter_ocr_noise_as_descriptive_target(
     assert input_ctl.clicks == [(145, 50)]
 
 
-def test_executor_confirms_dispatch_without_forced_verification_delay(tmp_path):
+def _ocr_scene(*texts: str) -> SceneObservation:
+    lines = [
+        TextLine(text, BoundingBox(10 + i * 60, 20, 50, 20), 0.9)
+        for i, text in enumerate(texts)
+    ]
+    return make_scene(np.zeros((80, 400, 3), dtype=np.uint8), lines)
+
+
+# ------------------------------------------------------------------- drags
+def _drag_executor(settings, context, input_ctl, journal, memory=None, planner=None):
+    if planner is None:
+        planner = TaskPlanner(
+            MockLLM(), settings, journal, context, threading.Event()
+        )
+    return PlanExecutor(
+        settings,
+        journal,
+        None,
+        input_ctl,
+        memory or MemoryManager(settings.memory_file),
+        planner,
+        context,
+        threading.Event(),
+        "t",
+    )
+
+
+def test_executor_drags_anchor_to_a_named_drop_target(tmp_path):
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    grab = TextLine("Report.txt", BoundingBox(300, 200, 100, 40), 0.99)
+    drop = TextLine("Trash", BoundingBox(60, 40, 80, 30), 0.99)
+    context = FakeContext([make_scene(frame, [grab, drop])])
+    input_ctl = RecordingInput()
+    settings = make_settings(tmp_path, verify_steps=False)
+    settings.ensure_dirs()
+    journal = make_journal(tmp_path)
+    memory = MemoryManager(settings.memory_file)
+    executor = _drag_executor(settings, context, input_ctl, journal, memory)
+    step = _step(
+        action=ActionType.DRAG,
+        target="Report.txt",
+        description="Drag Report.txt to Trash",
+        params={"to_target": "Trash"},
+    )
+
+    report = executor.execute(
+        "drag the report to the trash", TaskPlan(task_name="t", goal="", steps=[step])
+    )
+
+    assert report.success
+    assert input_ctl.drags == [((350, 220), (100, 55), "left", None, ())]
+    # The reflex replays in input space, so the delta must be stored there.
+    skill = memory.get_skill("drag_report_txt_to_trash")
+    assert skill is not None
+    assert skill.metadata["drag_delta"] == [-250, -165]
+    assert skill.metadata["drag_button"] == "left"
+
+
+def test_executor_drag_offset_drops_relative_to_the_grab_point(tmp_path):
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    grab = TextLine("Slider", BoundingBox(100, 100, 60, 20), 0.99)
+    context = FakeContext([make_scene(frame, [grab])])
+    input_ctl = RecordingInput()
+    journal = make_journal(tmp_path)
+    settings = make_settings(tmp_path, verify_steps=False)
+    settings.ensure_dirs()
+    executor = _drag_executor(settings, context, input_ctl, journal)
+    step = _step(
+        action=ActionType.DRAG,
+        target="Slider",
+        description="Nudge the slider",
+        params={"dx": 40, "dy": -25, "button": "right", "hold_keys": "shift"},
+    )
+
+    report = executor.execute(
+        "nudge the slider", TaskPlan(task_name="t", goal="", steps=[step])
+    )
+
+    assert report.success
+    assert input_ctl.drags == [((130, 110), (170, 85), "right", None, ("shift",))]
+
+
+def test_executor_fails_a_drag_whose_drop_target_is_not_on_screen(tmp_path):
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    grab = TextLine("Report.txt", BoundingBox(300, 200, 100, 40), 0.99)
+    context = FakeContext([make_scene(frame, [grab])])
+    input_ctl = RecordingInput()
+    journal = make_journal(tmp_path)
+    settings = make_settings(tmp_path, verify_steps=False)
+    settings.ensure_dirs()
+    step = _step(
+        action=ActionType.DRAG,
+        target="Report.txt",
+        description="Drag Report.txt to Archive",
+        params={"to_target": "Archive"},
+    )
+    executor = _drag_executor(
+        settings, context, input_ctl, journal, planner=FakePlanner(step)
+    )
+
+    report = executor.execute(
+        "file the report", TaskPlan(task_name="t", goal="", steps=[step])
+    )
+
+    # Dropping a payload at a guessed coordinate is worse than not dragging.
+    assert not report.success
+    assert input_ctl.drags == []
+
+
+def test_executor_drag_without_a_drop_hint_is_reported_as_a_failure(tmp_path):
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    grab = TextLine("Report.txt", BoundingBox(300, 200, 100, 40), 0.99)
+    context = FakeContext([make_scene(frame, [grab])])
+    input_ctl = RecordingInput()
+    journal = make_journal(tmp_path)
+    settings = make_settings(tmp_path, verify_steps=False)
+    settings.ensure_dirs()
+    step = _step(
+        action=ActionType.DRAG,
+        target="Report.txt",
+        description="Drag Report.txt somewhere",
+        params={},
+    )
+    executor = _drag_executor(
+        settings, context, input_ctl, journal, planner=FakePlanner(step)
+    )
+
+    report = executor.execute(
+        "drag the report", TaskPlan(task_name="t", goal="", steps=[step])
+    )
+
+    assert not report.success
+    assert input_ctl.drags == []
+
+
+def test_key_press_step_repeats_the_chord(tmp_path):
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    context = FakeContext([make_scene(frame, [])])
+    input_ctl = RecordingInput()
+    journal = make_journal(tmp_path)
+    settings = make_settings(tmp_path, verify_steps=False)
+    settings.ensure_dirs()
+    executor = _drag_executor(settings, context, input_ctl, journal)
+    step = _step(
+        action=ActionType.KEY_PRESS,
+        description="Cycle tabs",
+        params={"key": "ctrl+tab", "presses": 3},
+    )
+
+    report = executor.execute(
+        "cycle tabs", TaskPlan(task_name="t", goal="", steps=[step])
+    )
+
+    assert report.success
+    assert input_ctl.pressed == [("ctrl+tab", 3)]
+
+
+def test_key_press_step_extracts_key_from_target(tmp_path):
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    context = FakeContext([make_scene(frame, [])])
+    input_ctl = RecordingInput()
+    journal = make_journal(tmp_path)
+    settings = make_settings(tmp_path, verify_steps=False)
+    settings.ensure_dirs()
+    executor = _drag_executor(settings, context, input_ctl, journal)
+    # The route-replan prompt historically dropped params.key and put the
+    # keystroke in the target prose.
+    step = _step(
+        action=ActionType.KEY_PRESS,
+        description="Open the Start menu",
+        target="Windows key (Start menu)",
+    )
+
+    report = executor.execute(
+        "open start menu", TaskPlan(task_name="t", goal="", steps=[step])
+    )
+
+    assert report.success
+    assert input_ctl.pressed == [("win", 1)]
+
+
+def test_executor_clicks_explicit_bbox_center_without_any_anchor(tmp_path):
+    settings = make_settings(tmp_path, verify_steps=False)
+    settings.ensure_dirs()
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    context = FakeContext([make_scene(frame, [])])
+    input_ctl = RecordingInput()
+    journal = make_journal(tmp_path)
+    executor = _drag_executor(settings, context, input_ctl, journal)
+    # No OCR line, no icon, no plan frame -> the explicit pixel box is the
+    # only anchor left. The click must land on its centre.
+    step = _step(
+        action=ActionType.CLICK,
+        target="Chrome taskbar icon",
+        bbox=BoundingBox(100, 40, 60, 20),
+    )
+
+    report = executor.execute(
+        "click chrome", TaskPlan(task_name="t", goal="", steps=[step])
+    )
+
+    assert report.success
+    assert input_ctl.clicks == [(130, 50)]
+
+
+def test_best_ocr_target_ignores_word_fragments_inside_a_longer_word():
+    # "none" must not match inside "nonexistent": that false anchor used to
+    # click an unrelated label on the desktop.
+    scene = _ocr_scene("None)", "Untitled")
+
+    assert PlanExecutor._best_ocr_target("zzzzz nonexistent widget", scene) is None
+
+
+def test_best_ocr_target_still_matches_whole_word_containment():
+    scene = _ocr_scene("Save as", "savegame")
+
+    match = PlanExecutor._best_ocr_target("save", scene)
+
+    assert match is not None
+    assert match[0].text == "Save as"
+
+
+def test_best_ocr_target_needs_majority_word_overlap():
+    weak = _ocr_scene("report view")
+
+    assert PlanExecutor._best_ocr_target("export report dialog", weak) is None
+
+    strong = _ocr_scene("export report view")
+    match = PlanExecutor._best_ocr_target("export report dialog", strong)
+
+    assert match is not None
+    assert match[0].text == "export report view"
+
+
+def test_executor_confirms_dispatch_without_waiting_for_a_review_frame(tmp_path):
     settings = make_settings(tmp_path, verify_steps=True, max_step_retries=1)
     settings.ensure_dirs()
     frame = np.full((120, 160, 3), 200, dtype=np.uint8)
@@ -450,8 +1352,91 @@ def test_executor_confirms_dispatch_without_forced_verification_delay(tmp_path):
     assert report.success
     assert report.results[0].action_dispatched is True
     assert report.results[0].visually_verified is None
-    assert any("deferred by screenshot throttle" in note for note in report.results[0].notes)
+    assert any(
+        "post-step review could not capture a fresh frame" in note
+        for note in report.results[0].notes
+    )
     assert planner._fast.call_count == 0
+
+
+def test_executor_reviews_current_and_next_step_in_one_api_call(tmp_path):
+    settings = make_settings(tmp_path, verify_steps=True, max_step_retries=1)
+    settings.ensure_dirs()
+    frame = np.full((120, 160, 3), 200, dtype=np.uint8)
+    line = TextLine("Save", BoundingBox(40, 40, 40, 20), 0.99)
+    review_json = (
+        '{"step_ok": true, "step_reason": "button is visible", '
+        '"evidence_mode": "both", "visual_required": true, '
+        '"next_step": {"ready": true, "reason": "field is ready", '
+        '"guidance": "continue"}}'
+    )
+    context = FakeContext(
+        [
+            SceneObservation(
+                frame=frame,
+                text_lines=[line],
+                fresh=True,
+                image_b64="current-frame",
+            ),
+            SceneObservation(
+                frame=frame,
+                text_lines=[line],
+                fresh=True,
+                image_b64="after-save",
+            ),
+            SceneObservation(
+                frame=frame,
+                text_lines=[line],
+                fresh=True,
+                image_b64="next-frame",
+            ),
+            SceneObservation(
+                frame=frame,
+                text_lines=[line],
+                fresh=True,
+                image_b64="after-type",
+            ),
+        ]
+    )
+    input_ctl = RecordingInput()
+    journal = make_journal(tmp_path)
+    llm = MockLLM(response=review_json)
+    planner = TaskPlanner(llm, settings, journal, context, threading.Event())
+    executor = PlanExecutor(
+        settings,
+        journal,
+        None,
+        input_ctl,
+        MemoryManager(settings.memory_file),
+        planner,
+        context,
+        threading.Event(),
+        "t",
+    )
+
+    report = executor.execute(
+        "save and type",
+        TaskPlan(
+            task_name="t",
+            goal="",
+            steps=[
+                _step(index=1, target="Save", description="Click Save"),
+                _step(
+                    index=2,
+                    action=ActionType.TYPE,
+                    text="hello",
+                    description="Type greeting",
+                ),
+            ],
+        ),
+    )
+
+    assert report.success
+    assert llm.call_count == 2
+    assert all("step_review" in event.message for event in journal._events if event.kind == "AI_OUTPUT")
+    assert report.results[0].next_step_ready is True
+    assert report.results[0].visually_verified is True
+    assert "Next planned step 2" in llm.prompts[0]
 
 
 def test_executor_replaces_failed_route_without_replaying_completed_steps(tmp_path):
@@ -632,6 +1617,12 @@ def test_task_agent_requires_confirmation_and_declines(tmp_path, monkeypatch):
     assert input_ctl.clicks == []  # plan shown but nothing executed
 
 
+def test_task_report_path_is_safe_for_windows_task_names(tmp_path):
+    journal = TaskJournal('save: "draft"?', Path(tmp_path) / "reports")
+
+    assert journal.report_path().name == "save___draft.md"
+
+
 def test_task_agent_confirms_runs_and_reports(tmp_path, monkeypatch):
     agent, settings, input_ctl = _build_test_agent(tmp_path, monkeypatch, "y")
     assert agent.run_task("click export then type hello") is True
@@ -641,3 +1632,41 @@ def test_task_agent_confirms_runs_and_reports(tmp_path, monkeypatch):
     reports = list(settings.reports_dir.glob("*.md"))
     assert reports
     assert list(settings.templates_dir.glob("*.png"))
+
+
+def test_task_agent_can_use_non_console_confirmation_callback(tmp_path, monkeypatch):
+    agent, settings, input_ctl = _build_test_agent(tmp_path, monkeypatch, "n")
+    decisions: list[TaskPlan] = []
+
+    def approve(plan: TaskPlan) -> bool:
+        decisions.append(plan)
+        return True
+
+    agent._confirmation_callback = approve
+
+    assert agent.run_task("click export then type hello") is True
+    assert len(decisions) == 1
+    assert input_ctl.clicks == [(350, 220)]
+    assert input_ctl.typed == ["hello"]
+    assert list(settings.reports_dir.glob("*.md"))
+
+
+def test_task_agent_extracts_model_user_choice():
+    from furti_ai.agent import TaskAgent, UserChoiceRequest
+
+    plan = TaskPlan(
+        "task",
+        "",
+        [
+            PlanStep(
+                1,
+                "Which browser should I use?",
+                ActionType.ASK_USER,
+                params={"question": "Choose a browser", "options": ["Edge", "Chrome"]},
+            )
+        ],
+    )
+
+    request = TaskAgent._first_user_choice(plan)
+
+    assert request == UserChoiceRequest("Choose a browser", ("Edge", "Chrome"))

@@ -72,6 +72,41 @@ def test_context_records_last_screenshot_time(tmp_path):
     assert journal._events[-1].kind == "SCREENSHOT"
 
 
+class TextDetectorThatDies:
+    """Detector stand-in for a backend that fails after a successful load."""
+
+    runtime_failure = "oneDNN path is unavailable in this build"
+
+    def __init__(self):
+        self.available = True
+
+    def detect(self, _frame):
+        self.available = False
+        return []
+
+
+def test_context_surfaces_text_detection_failure_once(tmp_path):
+    journal = TaskJournal("ocr-failure", tmp_path)
+    settings = Settings(workspace=tmp_path, screenshot_min_interval=0.0)
+    context = VisualContextManager(
+        FakeScreen(),
+        text_detector=TextDetectorThatDies(),
+        icon_matcher=None,
+        settings=settings,
+        journal=journal,
+    )
+
+    context.observe("inspect the screen", force_fresh=True)
+    warnings = [event for event in journal._events if event.kind == "WARN"]
+    assert len(warnings) == 1
+    assert "text detection failed on every frame" in warnings[0].message
+
+    # A later frame must not repeat the same warning.
+    context._last_capture_ts = 0.0
+    context.observe("inspect the screen", force_fresh=True)
+    assert len([event for event in journal._events if event.kind == "WARN"]) == 1
+
+
 def test_status_window_applies_visual_signals_without_tk(tmp_path):
     window = StatusWindow()
     window._widgets = {

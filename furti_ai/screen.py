@@ -35,6 +35,15 @@ def map_capture_point_to_input(
 class PyAutoGuiScreen:
     """Concrete capture using pyautogui (Pillow under the hood)."""
 
+    def __init__(self) -> None:
+        # Pin DPI awareness before pyautogui/Pillow is first imported so the
+        # screenshot (physical pixels) and pyautogui.size() (mouse coords)
+        # always agree. Safe to call more than once: the OS ignores it once
+        # awareness is already set.
+        from .windows import set_process_dpi_aware
+
+        set_process_dpi_aware()
+
     def capture(self) -> np.ndarray:
         import cv2
         import pyautogui

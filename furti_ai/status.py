@@ -5,6 +5,13 @@
   and approximate cost). It is fed through a thread-safe queue so worker
   threads never touch Tk directly. Tk is started on the thread that calls
   :meth:`StatusWindow.run_until`.
+
+  It has two modes. Standalone (no ``master``) it owns its own ``tk.Tk`` root
+  and is driven by :meth:`StatusWindow.run_until` from the worker thread.
+  Embedded (``master`` given, used by the GUI where a mainloop is already
+  running) it creates a ``tk.Toplevel`` of the host window, pumps its queue
+  with ``after`` callbacks and is shown/hidden with
+  :meth:`StatusWindow.show` / :meth:`StatusWindow.hide`.
 * :class:`KillSwitch` -- a global hotkey listener. pyautogui has no
   keyboard-listener API (it can only *send* input), so the listener uses
   pynput; the default chord is ``Ctrl+Alt+K``. Pressing it sets a
@@ -15,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import queue
 import threading
 import time
@@ -28,14 +36,21 @@ class StatusWindow:
 
     MAX_LOG_LINES = 9
 
-    def __init__(self, title: str = "Furti AI — live status") -> None:
+    def __init__(
+        self,
+        title: str = "Furti AI — live status",
+        master: Any = None,
+    ) -> None:
         self._queue: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._title = title
+        self._master = master
+        self._embedded = master is not None
         self._root: Any = None
         self._widgets: dict[str, Any] = {}
         self._log_lines: list[str] = []
         self.available = True
         self._stop_callback: Optional[threading.Event] = None
+        self._poll_id: Any = None
         self._last_capture_epoch = 0.0
         self._last_capture_at = ""
         self._capture_signal_until = 0.0
@@ -43,6 +58,10 @@ class StatusWindow:
     # ------------------------------------------------------------ wiring up
     def start(self, stop_event: Optional[threading.Event] = None) -> None:
         """Build the Tk window. Call from the thread that runs ``run_until``."""
+        if self._root is not None:  # already built; refresh and reveal
+            self._stop_callback = stop_event
+            self.show()
+            return
         try:
             import tkinter as tk
         except ImportError as exc:  # headless / minimal Python installs
@@ -51,11 +70,19 @@ class StatusWindow:
             return
         try:
             self._stop_callback = stop_event
-            root = tk.Tk()
+            root = tk.Toplevel(self._master) if self._embedded else tk.Tk()
             root.title(self._title)
+            icon_path = Path(__file__).resolve().parent.parent / "icon.ico"
+            if icon_path.is_file():
+                try:
+                    root.iconbitmap(default=str(icon_path))
+                except Exception:
+                    pass
             root.attributes("-topmost", True)
             root.configure(bg="#101418")
-            root.resizable(False, False)
+            root.resizable(True, True)
+            if self._embedded:
+                root.protocol("WM_DELETE_WINDOW", self.hide)
 
             header = tk.Label(
                 root,
@@ -125,8 +152,14 @@ class StatusWindow:
                 anchor="w",
             )
             ai_header.pack(fill="x", padx=10, pady=(5, 0))
+            ai_frame = tk.Frame(root, bg="#101418")
+            ai_frame.pack(fill="both", expand=True, padx=10, pady=(2, 0))
+            if hasattr(ai_frame, "columnconfigure"):
+                ai_frame.columnconfigure(0, weight=1)
+            if hasattr(ai_frame, "rowconfigure"):
+                ai_frame.rowconfigure(0, weight=1)
             ai_output = tk.Text(
-                root,
+                ai_frame,
                 height=5,
                 width=62,
                 bg="#0a0d10",
@@ -136,7 +169,14 @@ class StatusWindow:
                 relief="flat",
                 wrap="word",
             )
-            ai_output.pack(fill="x", padx=10, pady=(2, 0))
+            ai_output.grid(row=0, column=0, sticky="nsew")
+            scrollbar_class = getattr(tk, "Scrollbar", None)
+            if scrollbar_class is not None and hasattr(ai_output, "yview"):
+                ai_scrollbar = scrollbar_class(
+                    ai_frame, orient="vertical", command=ai_output.yview
+                )
+                ai_scrollbar.grid(row=0, column=1, sticky="ns")
+                ai_output.configure(yscrollcommand=ai_scrollbar.set)
 
             log_frame = tk.Frame(root, bg="#101418")
             log_frame.pack(fill="both", expand=True, padx=10, pady=(6, 0))
@@ -152,6 +192,12 @@ class StatusWindow:
                 wrap="word",
             )
             log_text.pack(side="left", fill="both", expand=True)
+            if scrollbar_class is not None and hasattr(log_text, "yview"):
+                log_scrollbar = scrollbar_class(
+                    log_frame, orient="vertical", command=log_text.yview
+                )
+                log_scrollbar.pack(side="right", fill="y")
+                log_text.configure(yscrollcommand=log_scrollbar.set)
 
             stats_label = tk.Label(
                 root, text="Tokens: —  |  Cost: —", bg="#101418", fg="#9db4c0",
@@ -159,8 +205,22 @@ class StatusWindow:
             )
             stats_label.pack(fill="x", padx=10, pady=(4, 0))
 
+            controls = tk.Frame(root, bg="#101418")
+            controls.pack(fill="x", padx=10, pady=(6, 8))
+            minimize_button = tk.Button(
+                controls,
+                text="MINIMIZE",
+                command=getattr(root, "iconify", root.withdraw),
+                bg="#263f50",
+                fg="#d8e8ff",
+                activebackground="#345d75",
+                activeforeground="#ffffff",
+                font=("Segoe UI", 9, "bold"),
+                relief="flat",
+            )
+            minimize_button.pack(side="left", fill="x", expand=True, padx=(0, 5))
             stop_button = tk.Button(
-                root,
+                controls,
                 text="STOP TASK  (Ctrl+Alt+K)",
                 command=self._on_stop_clicked,
                 bg="#5a1e1e",
@@ -170,7 +230,7 @@ class StatusWindow:
                 font=("Segoe UI", 9, "bold"),
                 relief="flat",
             )
-            stop_button.pack(fill="x", padx=10, pady=(6, 8))
+            stop_button.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
             self._root = root
             self._widgets = {
@@ -185,6 +245,8 @@ class StatusWindow:
                 "stats": stats_label,
             }
             self._refresh_capture_age()
+            if self._embedded:
+                self._schedule_poll()
         except Exception as exc:  # tkinter can fail to init on odd displays
             logger.warning("Could not start status window: %s", exc)
             self.available = False
@@ -198,33 +260,109 @@ class StatusWindow:
     def close(self) -> None:
         self.post({"_close": True})
 
+    # ------------------------------------------------------ visibility (GUI
+    # host thread only)
+    def show(self) -> None:
+        """Build the window if needed, then reveal it (embedded mode)."""
+        if not self.available:
+            return
+        if self._root is None:
+            self.start(self._stop_callback)
+        root = self._root
+        if root is None:
+            return
+        try:
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)
+        except Exception as exc:
+            logger.debug("Could not show status window: %s", exc)
+        if self._embedded:
+            self._schedule_poll()
+
+    def hide(self) -> None:
+        """Withdraw the window without destroying it, so it can be reused."""
+        self._cancel_poll()
+        root = self._root
+        if root is None:
+            return
+        try:
+            root.withdraw()
+        except Exception as exc:
+            logger.debug("Could not hide status window: %s", exc)
+
     # -------------------------------------------------------- Tk-thread only
     def run_until(self, done_event: threading.Event, poll_ms: int = 150) -> None:
         """Run the Tk mainloop until ``done_event`` is set, then destroy."""
         if not self.available or self._root is None:
             done_event.wait()
             return
+        if self._embedded:
+            # The host window already owns the Tk mainloop; just block here.
+            done_event.wait()
+            return
         self._poll_queue(done_event, poll_ms)
-        self._root.mainloop()
+        root = self._root
+        if root is not None:  # _poll_queue may already have torn the window down
+            root.mainloop()
 
     def _poll_queue(self, done_event: threading.Event, poll_ms: int) -> None:
         root = self._root
         if root is None:
             return
-        try:
-            while True:
-                snapshot = self._queue.get_nowait()
-                if snapshot.get("_close"):
-                    self._shutdown()
-                    return
-                self._apply(snapshot)
-        except queue.Empty:
-            pass
+        if not self._drain():
+            return
         if done_event.is_set():
             self._shutdown()
             return
         self._refresh_capture_age()
         root.after(poll_ms, self._poll_queue, done_event, poll_ms)
+
+    def _schedule_poll(self, poll_ms: int = 150) -> None:
+        """Embedded-mode queue pump: runs on the host window's mainloop."""
+        root = self._root
+        if root is None or self._poll_id is not None:
+            return
+
+        def tick() -> None:
+            self._poll_id = None
+            try:
+                if not self._drain():
+                    return
+                self._refresh_capture_age()
+                self._schedule_poll(poll_ms)
+            except Exception as exc:  # a dead Tk widget must not kill the GUI
+                logger.debug("Status window poll stopped: %s", exc)
+                self._shutdown()
+
+        try:
+            self._poll_id = root.after(poll_ms, tick)
+        except Exception as exc:
+            logger.debug("Could not schedule status window poll: %s", exc)
+            self._shutdown()
+
+    def _cancel_poll(self) -> None:
+        poll_id = self._poll_id
+        self._poll_id = None
+        root = self._root
+        if poll_id is None or root is None:
+            return
+        try:
+            root.after_cancel(poll_id)
+        except Exception:
+            pass
+
+    def _drain(self) -> bool:
+        """Apply queued snapshots. Returns ``False`` once the window is gone."""
+        while True:
+            try:
+                snapshot = self._queue.get_nowait()
+            except queue.Empty:
+                return True
+            if snapshot.get("_close"):
+                self._shutdown()
+                return False
+            self._apply(snapshot)
 
     def _apply(self, snapshot: dict[str, Any]) -> None:
         widgets = self._widgets
@@ -340,8 +478,10 @@ class StatusWindow:
             self._stop_callback.set()
 
     def _shutdown(self) -> None:
+        self._cancel_poll()
         root = self._root
         self._root = None
+        self._widgets = {}
         if root is not None:
             try:
                 root.destroy()
@@ -356,9 +496,12 @@ class KillSwitch:
         self.hotkey = hotkey
         self.stop_event = stop_event
         self.enabled = False
+        self._listener: Any = None
 
     def start(self) -> None:
         """Begin listening on a daemon thread. Safe to call when pynput is absent."""
+        if self.enabled:
+            return
         try:
             from pynput import keyboard
         except ImportError:
@@ -372,10 +515,19 @@ class KillSwitch:
             listener = keyboard.GlobalHotKeys({self.hotkey: self._trigger})
             listener.daemon = True
             listener.start()
+            self._listener = listener
             self.enabled = True
             logger.info("Kill hotkey armed: %s", self.hotkey)
         except Exception as exc:
             logger.warning("Could not arm kill hotkey %s: %s", self.hotkey, exc)
+
+    def stop(self) -> None:
+        """Stop a listener so repeated tasks do not accumulate hotkey threads."""
+        listener = self._listener
+        self._listener = None
+        self.enabled = False
+        if listener is not None:
+            listener.stop()
 
     def _trigger(self) -> None:
         print(f"\n[KILL] Hotkey {self.hotkey} pressed — stopping task safely.")

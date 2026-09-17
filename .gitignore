@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 venv/
 .furti_ai/
+keys.json

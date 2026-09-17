@@ -19,7 +19,7 @@ import logging
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
@@ -81,6 +81,7 @@ class FakeInput:
 
     def __init__(self) -> None:
         self.clicks: list[tuple[int, int]] = []
+        self.drags: list[tuple[tuple[int, int], tuple[int, int]]] = []
 
     def click(self, x: int, y: int, button: str = "left") -> None:
         self.clicks.append((x, y))
@@ -91,10 +92,22 @@ class FakeInput:
     def right_click(self, x: int, y: int) -> None:
         self.clicks.append((x, y))
 
+    def drag(
+        self,
+        x: int,
+        y: int,
+        end_x: int,
+        end_y: int,
+        button: str = "left",
+        duration: Optional[float] = None,
+        hold_keys: Optional[list[str]] = None,
+    ) -> None:
+        self.drags.append(((x, y), (end_x, end_y)))
+
     def type_text(self, text: str) -> None:
         pass
 
-    def press_key(self, key: str) -> None:
+    def press_key(self, key: str, presses: int = 1) -> None:
         pass
 
     def scroll(self, clicks: int) -> None:
